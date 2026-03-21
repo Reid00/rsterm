@@ -542,14 +542,14 @@ rsterm/
 
 **目标：可用的 SSH 终端**
 
-- [x] SSH2 基础连接
-- [x] 密码认证
-- [x] 公钥认证（RSA/ED25519）
-- [x] 单窗口多标签
-- [x] 基础终端渲染（xterm-256color）
-- [x] 会话保存/加载
-- [x] 字体/主题配置
-- [x] 断线重连
+- [ ] SSH2 基础连接
+- [ ] 密码认证
+- [ ] 公钥认证（RSA/ED25519）
+- [ ] 单窗口多标签
+- [ ] 基础终端渲染（xterm-256color）
+- [ ] 会话保存/加载
+- [ ] 字体/主题配置
+- [ ] 断线重连
 
 **预计工作量：核心功能**
 
@@ -607,9 +607,10 @@ rsterm/
 | 决策项 | 选择 | 说明 |
 |-------|------|------|
 | 本地终端支持 | **远程 SSH + 本地 shell** | 既可连接远程，也可打开本地终端 |
-| 多窗口支持 | **仅多标签** | 所有会话在同一窗口，简洁统一 |
+| 多窗口模式 | **仅多标签页，不支持独立窗口** | 所有会话在同一窗口的标签页中，简洁统一 |
 | 配置文件格式 | **TOML** | 人类可读，Rust 生态友好 |
 | 更新机制 | **手动检查更新** | 菜单提供检查更新选项，提示下载 |
+| 密钥存储 | **系统密钥环 + 加密文件回退** | 优先使用系统密钥环，Windows 等平台不支持时回退到加密文件存储 |
 
 ---
 
@@ -1011,6 +1012,175 @@ pub struct AppChannels {
     pub command_rx: mpsc::Receiver<Command>,
     pub event_tx: mpsc::Sender<Event>,
     pub event_rx: mpsc::Receiver<Event>,
+}
+```
+
+**UI-异步状态同步详细模式**：
+
+```rust
+use std::sync::Arc;
+use tokio::sync::{Mutex, RwLock};
+use crossbeam_channel::{Receiver, Sender, bounded};
+
+/// 共享状态结构
+/// 设计原则：
+/// 1. 终端缓冲区使用 RwLock，读多写少
+/// 2. 会话状态使用 Mutex，需要独占访问
+/// 3. UI 通过 crossbeam channel 接收事件通知
+pub struct SharedState {
+    /// 终端缓冲区 - RwLock 允许多个读取者
+    pub terminal_buffers: Arc<RwLock<HashMap<SessionId, TerminalBuffer>>>,
+
+    /// 活动会话 - Mutex 保证独占访问
+    pub sessions: Arc<Mutex<HashMap<SessionId, ActiveSession>>>,
+
+    /// 传输任务队列
+    pub transfer_queue: Arc<Mutex<Vec<TransferTask>>>,
+
+    /// 连接状态（简单数据用原子操作）
+    pub connection_status: Arc<std::sync::RwLock<HashMap<SessionId, ConnectionStatus>>>,
+}
+
+/// UI 线程持有的状态快照
+/// 每帧从 SharedState 拉取更新
+pub struct UiState {
+    /// 终端缓冲区快照（只读）
+    terminal_buffers: HashMap<SessionId, TerminalBuffer>,
+
+    /// 连接状态快照
+    connection_status: HashMap<SessionId, ConnectionStatus>,
+
+    /// 待处理事件
+    pending_events: Vec<Event>,
+}
+
+/// 应用状态管理器
+pub struct AppState {
+    /// 共享状态（与 tokio 任务共享）
+    shared: SharedState,
+
+    /// UI 状态（仅 UI 线程访问）
+    ui: UiState,
+
+    /// 事件通道（tokio -> UI）
+    event_rx: Receiver<Event>,
+    event_tx: Sender<Event>,
+
+    /// 命令通道（UI -> tokio）
+    command_tx: mpsc::Sender<Command>,
+}
+
+impl AppState {
+    /// 在 UI 帧更新时调用
+    /// 拉取所有待处理事件并更新 UI 状态
+    pub fn update(&mut self) {
+        // 1. 非阻塞地拉取所有事件
+        while let Ok(event) = self.event_rx.try_recv() {
+            self.ui.pending_events.push(event);
+        }
+
+        // 2. 处理事件，更新 UI 状态
+        for event in self.ui.pending_events.drain(..) {
+            match event {
+                Event::TerminalOutput(session_id, data) => {
+                    // 更新终端缓冲区快照
+                    if let Some(buffer) = self.ui.terminal_buffers.get_mut(&session_id) {
+                        buffer.process_output(&data);
+                    }
+                }
+                Event::Connected(session_id) => {
+                    self.ui.connection_status.insert(session_id, ConnectionStatus::Connected);
+                }
+                Event::Disconnected(session_id, reason) => {
+                    self.ui.connection_status.insert(session_id, ConnectionStatus::Disconnected);
+                    // 可选：显示断开原因
+                }
+                _ => {}
+            }
+        }
+
+        // 3. 同步连接状态（低频操作）
+        if let Ok(status) = self.shared.connection_status.read() {
+            self.ui.connection_status = status.clone();
+        }
+    }
+
+    /// 发送命令到 tokio 运行时
+    pub fn send_command(&self, cmd: Command) {
+        let _ = self.command_tx.blocking_send(cmd);
+    }
+}
+
+/// 锁顺序规则（防止死锁）：
+/// 1. 永远按照 terminal_buffers -> sessions -> transfer_queue 顺序获取锁
+/// 2. 不要在持有锁的情况下调用可能阻塞的操作
+/// 3. 尽量减少锁的持有时间
+```
+
+**终端缓冲区同步策略**：
+
+```rust
+/// 终端缓冲区的增量更新机制
+pub struct TerminalBuffer {
+    /// 完整内容
+    grid: Grid,
+
+    /// 脏区域标记（减少渲染工作量）
+    damage: DamageTracker,
+
+    /// 版本号（用于检测变化）
+    version: u64,
+}
+
+/// 脏区域追踪器
+pub struct DamageTracker {
+    /// 受影响的行范围
+    damaged_rows: Vec<Range<usize>>,
+
+    /// 是否需要完全重绘
+    full_redraw: bool,
+}
+
+impl TerminalBuffer {
+    /// 处理输出，标记脏区域
+    pub fn process_output(&mut self, data: &[u8]) {
+        let start_row = self.grid.cursor_row();
+        // ... 解析并更新 grid ...
+        let end_row = self.grid.cursor_row();
+
+        self.damage.damaged_rows.push(start_row..end_row);
+        self.version += 1;
+    }
+
+    /// 获取脏区域并清除
+    pub fn take_damage(&mut self) -> Vec<Range<usize>> {
+        std::mem::take(&mut self.damage.damaged_rows)
+    }
+}
+```
+
+**复制粘贴快捷键处理**：
+
+```rust
+/// 在 UI 层处理复制粘贴，不发送到 PTY
+impl TerminalView {
+    pub fn handle_key(&mut self, key: &KeyEvent) -> bool {
+        // 复制粘贴在 UI 层处理
+        if key.modifiers.ctrl && key.logical_key == Key::Character("c".into()) {
+            if self.selection.is_some() {
+                self.copy_selection();
+                return true;  // 消费事件，不发送到 PTY
+            }
+        }
+
+        if key.modifiers.ctrl && key.logical_key == Key::Character("v".into()) {
+            self.paste();
+            return true;
+        }
+
+        // 其他按键发送到终端处理
+        self.terminal.handle_key_event(key)
+    }
 }
 ```
 
@@ -1586,6 +1756,94 @@ pub struct SearchState {
     pub matches: Vec<Range<Position>>,
     pub current_match: usize,
     pub direction: SearchDirection,
+}
+
+/// 终端字体配置
+pub struct TerminalFonts {
+    /// 主字体（常规）
+    pub regular: egui::FontId,
+    /// 粗体字体
+    pub bold: egui::FontId,
+    /// 斜体字体
+    pub italic: egui::FontId,
+    /// 粗斜体字体
+    pub bold_italic: egui::FontId,
+    /// 单元格尺寸 (width, height)
+    pub cell_size: egui::Vec2,
+}
+
+impl TerminalFonts {
+    pub fn new(font_name: &str, font_size: f32) -> Self {
+        Self {
+            regular: egui::FontId::proportional(font_size),
+            bold: egui::FontId::proportional(font_size),
+            italic: egui::FontId::proportional(font_size),
+            bold_italic: egui::FontId::proportional(font_size),
+            // 需要根据实际字体测量
+            cell_size: egui::Vec2::new(font_size * 0.6, font_size * 1.2),
+        }
+    }
+
+    pub fn get_font(&self, flags: CellFlags) -> &egui::FontId {
+        match (flags.contains(CellFlags::BOLD), flags.contains(CellFlags::ITALIC)) {
+            (true, true) => &self.bold_italic,
+            (true, false) => &self.bold,
+            (false, true) => &self.italic,
+            (false, false) => &self.regular,
+        }
+    }
+}
+
+/// 脏区域追踪器
+pub struct DamageTracker {
+    /// 受影响的行范围
+    pub damaged_rows: Vec<Range<usize>>,
+    /// 是否需要完全重绘
+    pub full_redraw: bool,
+}
+
+impl DamageTracker {
+    pub fn new() -> Self {
+        Self {
+            damaged_rows: Vec::new(),
+            full_redraw: false,
+        }
+    }
+
+    /// 标记行范围为脏
+    pub fn mark_dirty(&mut self, rows: Range<usize>) {
+        self.damaged_rows.push(rows);
+    }
+
+    /// 标记需要完全重绘
+    pub fn mark_full_redraw(&mut self) {
+        self.full_redraw = true;
+        self.damaged_rows.clear();
+    }
+
+    /// 获取脏区域并清除
+    pub fn take_damage(&mut self) -> Vec<Range<usize>> {
+        std::mem::take(&mut self.damaged_rows)
+    }
+
+    /// 是否有任何损坏
+    pub fn is_dirty(&self) -> bool {
+        self.full_redraw || !self.damaged_rows.is_empty()
+    }
+}
+
+/// 搜索方向
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SearchDirection {
+    Forward,
+    Backward,
+}
+
+/// 位置（行列）
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Position {
+    pub row: usize,
+    pub col: usize,
 }
 ```
 
