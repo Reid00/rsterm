@@ -31,31 +31,34 @@ impl Selection {
     }
 
     pub fn contains(&self, pos: &Position) -> bool {
-        let (min_row, max_row) = if self.start.row <= self.end.row {
-            (self.start.row, self.end.row)
+        // Normalize start and end based on actual position (handles backward selection)
+        let (start, end) = if self.start.row < self.end.row
+            || (self.start.row == self.end.row && self.start.col <= self.end.col)
+        {
+            (&self.start, &self.end)
         } else {
-            (self.end.row, self.start.row)
+            (&self.end, &self.start)
         };
 
-        if pos.row < min_row || pos.row > max_row {
+        if pos.row < start.row || pos.row > end.row {
             return false;
         }
 
-        if self.start.row == self.end.row {
-            let (min_col, max_col) = if self.start.col <= self.end.col {
-                (self.start.col, self.end.col)
-            } else {
-                (self.end.col, self.start.col)
-            };
-            return pos.col >= min_col && pos.col <= max_col;
+        if start.row == end.row {
+            return pos.col >= start.col && pos.col <= end.col;
         }
 
-        if pos.row == min_row && pos.row != max_row {
-            return pos.col >= self.start.col;
+        // First row: from start.col to end of line
+        if pos.row == start.row {
+            return pos.col >= start.col;
         }
-        if pos.row == max_row && pos.row != min_row {
-            return pos.col <= self.end.col;
+
+        // Last row: from beginning to end.col
+        if pos.row == end.row {
+            return pos.col <= end.col;
         }
+
+        // Middle rows: entire row is selected
         true
     }
 }
