@@ -3,6 +3,13 @@
 > 创建日期: 2026-03-21
 > 基于: rsterm-feature-design.md
 > 目标: 细化 MVP 所有子系统到可直接编码的程度
+>
+> 注意: 本文档相对 feature-design.md 的有意偏离:
+> - 去掉 SharedState/锁模式，改为纯消息传递（简化并发）
+> - PtyBackend 从同步改为异步 push 模式
+> - SFTP 基础功能提前到 MVP（原 spec 在 v0.3.0）
+> - AuthConfig.Password 暂用明文存储（原 spec 用 keyring_id）
+> - 首版 UI 为英文（原 spec 中文示例仅为文档说明用途）
 
 ---
 
@@ -39,7 +46,7 @@
 
 ### 2.1 PtyBackend trait — 异步 push 模式
 
-现有 spec 用同步 `Read/Write`，但 SSH 通道是异步的。统一为异步接口，且去掉 `read()` 改用 push 模式——后端通过 `output_tx: mpsc::Sender<Vec<u8>>` 主动推送数据。
+`PtyBackend` 是 Tokio 任务内部使用的 trait，用于统一 SSH PTY 和本地 PTY 的 I/O 接口。UI 线程不直接接触它——Tokio 任务负责创建 PtyBackend 实现，启动读写循环，并通过 channel 对与 UI 线程通信。
 
 ```rust
 #[async_trait]
@@ -47,23 +54,41 @@ pub trait PtyBackend: Send + Sync + 'static {
     async fn write(&self, data: &[u8]) -> Result<(), PtyError>;
     async fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyError>;
     fn is_alive(&self) -> bool;
-    // 注意：没有 read()
-    // 后端通过 output_tx: mpsc::Sender<Vec<u8>> 主动推送数据
-    // SSH 通道的 data 回调天然是 push 的
-    // 本地 PTY 也 spawn 一个读取循环 push 到 channel
-    // Terminal 不需要轮询
+    // 没有 read() — 实现者在内部 spawn 读取循环，
+    // 通过构造时传入的 output_tx: mpsc::Sender<Vec<u8>> 推送数据
 }
+
+/// Tokio 任务如何使用 PtyBackend：
+///
+/// async fn run_pty_session(
+///     pty: Box<dyn PtyBackend>,
+///     input_rx: mpsc::Receiver<Vec<u8>>,  // 来自 UI 的键盘输入
+///     output_tx: mpsc::Sender<Vec<u8>>,   // 发送到 UI 的终端输出
+/// ) {
+///     // PtyBackend 实现在 new() 时已启动内部读取循环 -> output_tx
+///     // 此任务只需转发 UI 输入到 PTY
+///     while let Some(data) = input_rx.recv().await {
+///         if pty.write(&data).await.is_err() { break; }
+///     }
+/// }
 ```
 
 ### 2.2 Terminal 模块 — 解耦输入输出
 
-Terminal 不拥有 PtyBackend，只处理纯终端逻辑：
+Terminal 不拥有 PtyBackend，只处理纯终端逻辑。它是一个纯状态机：接收输出字节更新内部状态，接收按键返回需要发送给 PTY 的字节。由调用者（App/Tab）负责通过 `input_tx` 发送这些字节。
 
 ```rust
 pub struct Terminal {
-    // 构造时传入，Terminal 不拥有 PtyBackend
-    output_tx: mpsc::Sender<Vec<u8>>,  // 发送到 PTY
-    // ... grid, cursor, scrollback 等
+    // 纯终端状态，不持有任何 I/O 通道
+    grid: Grid,
+    alternate_grid: Option<Grid>,
+    cursor: Cursor,
+    scrollback: ScrollBuffer,
+    mode: TerminalMode,
+    size: Size,
+    selection: Option<Selection>,
+    damage: DamageTracker,
+    title: String,
 }
 
 impl Terminal {
@@ -73,13 +98,14 @@ impl Terminal {
     pub fn process_output(&mut self, data: &[u8]);
 
     /// 处理键盘输入，返回需要发送到 PTY 的字节
+    /// 调用者负责通过 Tab.input_tx 发送返回的字节
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Vec<u8>>;
 
     /// 获取渲染快照（不可变引用）
     pub fn render_snapshot(&self) -> &Grid;
 
     /// 获取并清除脏区域
-    pub fn take_damage(&mut self) -> DamageInfo;
+    pub fn take_damage(&mut self) -> DamageReport;
 
     /// 调整大小
     pub fn resize(&mut self, cols: u16, rows: u16);
@@ -135,7 +161,7 @@ impl SshSession {
 
 ```rust
 pub struct ConfigManager {
-    config_dir: PathBuf,  // ~/.config/rsterm/
+    base_dir: PathBuf,  // ~/.config/rsterm/ (或平台等效路径)
 }
 
 impl ConfigManager {
@@ -230,6 +256,146 @@ pub struct SessionChannels {
     /// PTY/SSH -> UI（终端输出）
     pub output_rx: mpsc::Receiver<Vec<u8>>,
 }
+
+/// ===== 全局命令（UI -> Backend）=====
+pub enum AppCommand {
+    /// 发起 SSH 连接
+    Connect {
+        session_config: SessionConfig,
+        terminal_size: Size,
+    },
+    /// 打开本地 PTY
+    OpenLocalPty {
+        shell: String,
+        terminal_size: Size,
+    },
+    /// 断开指定会话
+    Disconnect { session_id: SessionId },
+    /// 调整终端大小（通过后端转发到 PTY/SSH）
+    Resize {
+        session_id: SessionId,
+        cols: u16,
+        rows: u16,
+    },
+    /// SFTP: 列出目录
+    SftpListDir {
+        session_id: SessionId,
+        path: String,
+    },
+    /// SFTP: 上传文件
+    SftpUpload {
+        session_id: SessionId,
+        local_path: PathBuf,
+        remote_path: String,
+    },
+    /// SFTP: 下载文件
+    SftpDownload {
+        session_id: SessionId,
+        remote_path: String,
+        local_path: PathBuf,
+    },
+    /// SFTP: 文件操作 (mkdir/delete/rename)
+    SftpFileOp {
+        session_id: SessionId,
+        op: SftpFileOperation,
+    },
+    /// 响应主机密钥验证弹窗
+    HostKeyResponse {
+        session_id: SessionId,
+        accepted: bool,
+    },
+    /// 响应密码输入弹窗
+    PasswordResponse {
+        session_id: SessionId,
+        password: String,
+    },
+}
+
+pub enum SftpFileOperation {
+    Mkdir(String),
+    Delete(String),
+    Rename { from: String, to: String },
+}
+
+/// ===== 全局事件（Backend -> UI）=====
+pub enum AppEvent {
+    /// SSH/PTY 连接成功，携带数据通道
+    Connected {
+        session_id: SessionId,
+        channels: SessionChannels,
+        server_banner: Option<String>,
+    },
+    /// 连接断开
+    Disconnected {
+        session_id: SessionId,
+        reason: Option<String>,
+    },
+    /// 连接/认证/协议错误
+    Error {
+        session_id: Option<SessionId>,
+        error: AppError,
+    },
+    /// 需要用户确认主机密钥
+    HostKeyVerify {
+        session_id: SessionId,
+        host: String,
+        fingerprint: String,
+    },
+    /// 需要用户输入密码（密码未保存时）
+    PasswordRequired {
+        session_id: SessionId,
+        host: String,
+        username: String,
+    },
+    /// 正在重连
+    Reconnecting {
+        session_id: SessionId,
+        attempt: u32,
+        max_attempts: u32,
+    },
+    /// SFTP 目录列表结果
+    SftpDirListed {
+        session_id: SessionId,
+        path: String,
+        entries: Result<Vec<FileInfo>, SftpError>,
+    },
+    /// SFTP 传输进度
+    SftpTransferProgress {
+        session_id: SessionId,
+        progress: f32,     // 0.0 - 1.0
+        filename: String,
+    },
+    /// SFTP 传输完成/失败
+    SftpTransferDone {
+        session_id: SessionId,
+        result: Result<(), SftpError>,
+    },
+    /// SFTP 文件操作完成
+    SftpFileOpDone {
+        session_id: SessionId,
+        result: Result<(), SftpError>,
+    },
+}
+
+/// ===== 基础类型 =====
+
+pub type SessionId = String;  // UUID v4 string
+pub type TabId = u64;
+
+/// 终端尺寸
+#[derive(Clone, Copy, Debug)]
+pub struct Size {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// 脏区域报告
+pub struct DamageReport {
+    /// 需要重绘的行范围
+    pub dirty_rows: Vec<Range<usize>>,
+    /// 是否需要完全重绘（resize/alternate screen 切换等）
+    pub full_redraw: bool,
+}
 ```
 
 ### 3.3 消息流序列图
@@ -304,16 +470,44 @@ pub struct App {
     notifications: Vec<Notification>,
 }
 
+/// 标签页类型
+pub enum TabKind {
+    /// SSH 远程连接
+    Ssh { session_config_id: String },
+    /// 本地终端
+    Local { shell: String },
+}
+
 pub struct Tab {
     pub id: TabId,
     pub title: String,
-    pub session_id: SessionId,
+    pub kind: TabKind,
+    pub session_id: SessionId,      // 运行时唯一标识（本地/远程通用）
     pub terminal: Terminal,
     pub input_tx: mpsc::Sender<Vec<u8>>,
     pub output_rx: mpsc::Receiver<Vec<u8>>,
-    pub status: ConnectionStatus,
+    pub status: ConnectionState,
     pub sftp: Option<SftpState>,
 }
+
+/// SFTP 面板运行时状态
+pub struct SftpState {
+    pub local_path: PathBuf,
+    pub remote_path: String,
+    pub local_entries: Vec<FileInfo>,
+    pub remote_entries: Vec<FileInfo>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub active_transfer: Option<TransferProgress>,
+}
+
+pub struct TransferProgress {
+    pub filename: String,
+    pub direction: TransferDirection,  // Upload / Download
+    pub progress: f32,                 // 0.0 - 1.0
+}
+
+pub enum TransferDirection { Upload, Download }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -332,9 +526,9 @@ impl eframe::App for App {
         // 3. 渲染 UI
         self.render_ui(ctx);
 
-        // 4. 如果有活跃连接，请求持续重绘
+        // 4. 如果有活跃连接，节流重绘（30fps 空闲，有数据时立即）
         if self.has_active_connections() {
-            ctx.request_repaint();
+            ctx.request_repaint_after(Duration::from_millis(33));
         }
     }
 }
@@ -379,6 +573,17 @@ impl eframe::App for App {
 ```
 
 ```rust
+/// 连接事件（触发状态转换）
+pub enum ConnectionEvent {
+    UserConnect,
+    UserDisconnect,
+    UserRetry,
+    Success { banner: Option<String> },
+    Timeout,
+    AuthFailed(String),
+    NetworkError(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionState {
     Disconnected,
@@ -413,7 +618,7 @@ impl ConnectionState {
 
             (Connecting, ConnectionEvent::Timeout) =>
                 Some(Error {
-                    error: "连接超时".into(),
+                    error: "Connection timed out".into(),
                     can_retry: true,
                 }),
 
@@ -452,7 +657,7 @@ impl ConnectionState {
 
             (Reconnecting { .. }, ConnectionEvent::NetworkError(e)) =>
                 Some(Error {
-                    error: format!("重连失败: {}", e),
+                    error: format!("Reconnection failed: {}", e),
                     can_retry: true,
                 }),
 
@@ -536,6 +741,132 @@ pub enum ModalDialog {
         message: String,
     },
 }
+
+### 4.4 Theme 结构
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Theme {
+    pub name: String,
+    pub ui: UiColors,
+    pub terminal: TerminalColorPalette,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiColors {
+    pub background: [u8; 3],
+    pub foreground: [u8; 3],
+    pub tab_active_bg: [u8; 3],
+    pub tab_inactive_bg: [u8; 3],
+    pub panel_bg: [u8; 3],
+    pub selection_bg: [u8; 4],    // RGBA, 半透明
+    pub statusbar_bg: [u8; 3],
+    pub accent: [u8; 3],
+    pub error: [u8; 3],
+    pub warning: [u8; 3],
+    pub success: [u8; 3],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalColorPalette {
+    /// ANSI 16 色 (0-15)
+    pub ansi: [[u8; 3]; 16],
+    /// 终端默认前景/背景
+    pub fg: [u8; 3],
+    pub bg: [u8; 3],
+    /// 光标颜色
+    pub cursor: [u8; 3],
+}
+
+impl Theme {
+    pub fn default_dark() -> Self;
+    pub fn default_light() -> Self;
+
+    // UI 颜色便捷方法
+    pub fn terminal_fg(&self) -> egui::Color32;
+    pub fn terminal_bg(&self) -> egui::Color32;
+    pub fn selection_bg(&self) -> egui::Color32;
+    pub fn tab_active_bg(&self) -> egui::Color32;
+    pub fn tab_inactive_bg(&self) -> egui::Color32;
+
+    /// 将 ANSI 索引色 (0-255) 转为 egui 颜色
+    /// 0-15: 从 ansi[] 查表
+    /// 16-231: 6x6x6 色立方体
+    /// 232-255: 灰度
+    pub fn indexed_color(&self, idx: u8) -> egui::Color32;
+}
+```
+
+### 4.5 后端命令分发循环
+
+```rust
+/// Tokio 运行时中的命令处理主循环
+async fn backend_loop(
+    mut command_rx: mpsc::Receiver<AppCommand>,
+    event_tx: mpsc::Sender<AppEvent>,
+) {
+    // 活跃的会话句柄（用于 resize/disconnect）
+    let mut session_handles: HashMap<SessionId, SessionHandle> = HashMap::new();
+
+    while let Some(cmd) = command_rx.recv().await {
+        match cmd {
+            AppCommand::Connect { session_config, terminal_size } => {
+                let event_tx = event_tx.clone();
+                let session_id = session_config.id.clone();
+
+                tokio::spawn(async move {
+                    // 创建 per-session 通道
+                    let (input_tx, input_rx) = mpsc::channel(256);
+                    let (output_tx, output_rx) = mpsc::channel(256);
+
+                    match ssh_connect(&session_config, terminal_size, input_rx, output_tx).await {
+                        Ok(handle) => {
+                            event_tx.send(AppEvent::Connected {
+                                session_id: session_id.clone(),
+                                channels: SessionChannels { session_id, input_tx, output_rx },
+                                server_banner: handle.banner.clone(),
+                            }).await.ok();
+                            // handle 存入 session_handles 用于后续 resize/disconnect
+                        }
+                        Err(e) => {
+                            event_tx.send(AppEvent::Error {
+                                session_id: Some(session_id),
+                                error: e.into(),
+                            }).await.ok();
+                        }
+                    }
+                });
+            }
+
+            AppCommand::OpenLocalPty { shell, terminal_size } => {
+                // 类似 Connect，但创建 LocalPty 而非 SSH
+            }
+
+            AppCommand::Disconnect { session_id } => {
+                if let Some(handle) = session_handles.remove(&session_id) {
+                    handle.disconnect().await.ok();
+                }
+            }
+
+            AppCommand::Resize { session_id, cols, rows } => {
+                if let Some(handle) = session_handles.get(&session_id) {
+                    handle.resize(cols, rows).await.ok();
+                }
+            }
+
+            // SFTP 命令: spawn 独立任务处理
+            AppCommand::SftpListDir { session_id, path } => { /* ... */ }
+            AppCommand::SftpUpload { .. } => { /* ... */ }
+            AppCommand::SftpDownload { .. } => { /* ... */ }
+            AppCommand::SftpFileOp { .. } => { /* ... */ }
+
+            // 交互响应（转发到等待中的认证任务）
+            AppCommand::HostKeyResponse { .. } => { /* ... */ }
+            AppCommand::PasswordResponse { .. } => { /* ... */ }
+        }
+    }
+}
+```
 
 ---
 
@@ -1159,9 +1490,12 @@ pub mod platform {
 
     /// 展开路径中的 ~ 和环境变量
     pub fn expand_path(path: &str) -> PathBuf {
-        if path.starts_with('~') {
-            if let Some(home) = dirs::home_dir() {
-                return home.join(&path[2..]);  // 跳过 "~/"
+        if let Some(home) = dirs::home_dir() {
+            if path == "~" {
+                return home;
+            }
+            if let Some(rest) = path.strip_prefix("~/") {
+                return home.join(rest);
             }
         }
 
@@ -1464,6 +1798,15 @@ pub struct TerminalWidget<'a> {
     theme: &'a Theme,
     fonts: &'a TerminalFonts,
     focused: bool,
+    /// 收集本帧需要发送到 PTY 的输入字节
+    pending_input: &'a mut Vec<u8>,
+    /// IME 预编辑状态
+    ime_preedit: Option<ImePreedit>,
+}
+
+pub struct ImePreedit {
+    pub text: String,
+    pub cursor: Option<(usize, usize)>,
 }
 
 impl<'a> TerminalWidget<'a> {
@@ -1472,8 +1815,9 @@ impl<'a> TerminalWidget<'a> {
         theme: &'a Theme,
         fonts: &'a TerminalFonts,
         focused: bool,
+        pending_input: &'a mut Vec<u8>,
     ) -> Self {
-        Self { terminal, theme, fonts, focused }
+        Self { terminal, theme, fonts, focused, pending_input, ime_preedit: None }
     }
 }
 
@@ -1702,24 +2046,47 @@ impl App {
                     self.settings.app.font_size,
                 );
 
+                let mut pending_input = Vec::new();
                 let widget = TerminalWidget::new(
                     &mut tab.terminal,
                     &self.theme,
                     &fonts,
                     true,  // focused
+                    &mut pending_input,
                 );
 
-                let response = ui.add(widget);
+                ui.add(widget);
 
-                // 发送 pending input 到 PTY
-                // (从 widget 收集待发送的输入字节)
+                // 发送收集到的输入字节到 PTY
+                if !pending_input.is_empty() {
+                    let _ = tab.input_tx.try_send(pending_input);
+                }
             }
         }
     }
 }
 ```
 
-### 8.6 新建连接对话框
+### 8.6 MVP 键盘快捷键
+
+以下快捷键在 UI 层拦截，不发送到终端：
+
+| 快捷键 | 功能 |
+|--------|------|
+| `Ctrl+Shift+T` | 新建本地终端标签 |
+| `Ctrl+Shift+N` | 打开新建连接对话框 |
+| `Ctrl+Shift+W` | 关闭当前标签 |
+| `Ctrl+Tab` | 切换到下一个标签 |
+| `Ctrl+Shift+Tab` | 切换到上一个标签 |
+| `Ctrl+Shift+C` | 复制选中文本 |
+| `Ctrl+Shift+V` | 粘贴 |
+| `Ctrl+Shift+L` | 切换 SFTP 面板 |
+| `Ctrl+,` | 打开设置 |
+| `F11` | 全屏切换 |
+
+**注意**: `Ctrl+C` / `Ctrl+V` 不拦截——发送到终端。复制粘贴使用 `Ctrl+Shift+C/V`。当有文本选中时 `Ctrl+Shift+C` 复制；无选中时不拦截。
+
+### 8.7 新建连接对话框
 
 ```rust
 pub struct NewConnectionState {
@@ -1830,6 +2197,31 @@ impl App {
                     }
                 });
             });
+    }
+}
+```
+
+---
+
+### 8.8 窗口关闭与优雅退出
+
+```rust
+impl App {
+    /// eframe 在窗口关闭时调用
+    fn on_exit(&mut self) {
+        // 1. 保存设置
+        let _ = self.config.save_settings(&self.settings);
+
+        // 2. 断开所有连接
+        for tab in &self.tabs {
+            let _ = self.command_tx.blocking_send(
+                AppCommand::Disconnect { session_id: tab.session_id.clone() }
+            );
+        }
+
+        // 3. Tokio runtime 的 drop 会等待所有 spawned 任务完成
+        //    但给一个超时，防止阻塞关闭
+        //    Runtime::shutdown_timeout(Duration::from_secs(3))
     }
 }
 ```
