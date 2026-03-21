@@ -37,6 +37,8 @@ pub enum SshError {
     ChannelClosed,
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Russh(#[from] russh::Error),
 }
 
 #[derive(Debug, Error)]
