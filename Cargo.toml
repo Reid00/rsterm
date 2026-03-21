@@ -1,0 +1,53 @@
+[package]
+name = "rsterm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["rt-multi-thread", "sync", "time", "process", "io-util", "fs"] }
+futures-util = "0.3"
+
+# GUI
+eframe = { version = "0.29", default-features = false, features = ["glow", "persistence"] }
+egui = "0.29"
+egui_extras = { version = "0.29", features = ["image"] }
+
+# SSH
+russh = "0.45"
+russh-keys = "0.45"
+russh-sftp = "2.0"
+
+# Terminal parsing
+vte = "0.13"
+
+# Local PTY
+portable-pty = "0.8"
+
+# Configuration
+toml = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+dirs = "5.0"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+uuid = { version = "1.10", features = ["v4"] }
+bitflags = "2.6"
+parking_lot = "0.12"
+which = "6.0"
+shellexpand = "3.1"
+unicode-width = "0.2"
+async-trait = "0.1"
+
+# File dialogs
+rfd = "0.15"
+
+[build-dependencies]
+# For embedding assets
