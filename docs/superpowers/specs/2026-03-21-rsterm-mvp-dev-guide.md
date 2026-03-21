@@ -509,29 +509,12 @@ pub struct TransferProgress {
 
 pub enum TransferDirection { Upload, Download }
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 1. 拉取全局事件
-        while let Ok(event) = self.event_rx.try_recv() {
-            self.handle_event(event);
-        }
-
-        // 2. 拉取每个标签的终端输出
-        for tab in &mut self.tabs {
-            while let Ok(data) = tab.output_rx.try_recv() {
-                tab.terminal.process_output(&data);
-            }
-        }
-
-        // 3. 渲染 UI
-        self.render_ui(ctx);
-
-        // 4. 如果有活跃连接，节流重绘（30fps 空闲，有数据时立即）
-        if self.has_active_connections() {
-            ctx.request_repaint_after(Duration::from_millis(33));
-        }
-    }
-}
+/// eframe::App::update() 概要（完整实现见 8.2 节）
+/// 每帧执行：
+///   1. 非阻塞 try_recv 全局 AppEvent
+///   2. 非阻塞 try_recv 每个 Tab 的终端输出（限 256KB/帧防阻塞）
+///   3. 渲染 UI（工具栏、会话面板、标签栏、终端、状态栏、模态框）
+///   4. 有活跃连接时 request_repaint_after(33ms) 实现 30fps 节流
 ```
 
 ---
@@ -741,6 +724,7 @@ pub enum ModalDialog {
         message: String,
     },
 }
+```
 
 ### 4.4 Theme 结构
 
@@ -800,6 +784,28 @@ impl Theme {
 ### 4.5 后端命令分发循环
 
 ```rust
+/// 会话句柄（后端持有，用于 resize/disconnect）
+pub struct SessionHandle {
+    pub session_id: SessionId,
+    pub pty_backend: Box<dyn PtyBackend>,
+    pub banner: Option<String>,
+}
+
+impl SessionHandle {
+    pub async fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyError> {
+        self.pty_backend.resize(cols, rows).await
+    }
+    pub async fn disconnect(&self) -> Result<(), SshError> {
+        // 关闭 SSH 通道或终止本地 PTY 进程
+        Ok(())
+    }
+}
+
+/// 内部命令：spawned 任务完成连接后发回句柄
+enum InternalEvent {
+    HandleReady { session_id: SessionId, handle: SessionHandle },
+}
+
 /// Tokio 运行时中的命令处理主循环
 async fn backend_loop(
     mut command_rx: mpsc::Receiver<AppCommand>,
@@ -808,61 +814,87 @@ async fn backend_loop(
     // 活跃的会话句柄（用于 resize/disconnect）
     let mut session_handles: HashMap<SessionId, SessionHandle> = HashMap::new();
 
-    while let Some(cmd) = command_rx.recv().await {
-        match cmd {
-            AppCommand::Connect { session_config, terminal_size } => {
-                let event_tx = event_tx.clone();
-                let session_id = session_config.id.clone();
+    // 内部通道：spawned 任务把句柄发回 backend_loop
+    let (internal_tx, mut internal_rx) = mpsc::channel::<InternalEvent>(64);
 
-                tokio::spawn(async move {
-                    // 创建 per-session 通道
-                    let (input_tx, input_rx) = mpsc::channel(256);
-                    let (output_tx, output_rx) = mpsc::channel(256);
+    loop {
+        tokio::select! {
+            // 处理来自 UI 的命令
+            Some(cmd) = command_rx.recv() => {
+                match cmd {
+                    AppCommand::Connect { session_config, terminal_size } => {
+                        let event_tx = event_tx.clone();
+                        let internal_tx = internal_tx.clone();
+                        let session_id = session_config.id.clone();
 
-                    match ssh_connect(&session_config, terminal_size, input_rx, output_tx).await {
-                        Ok(handle) => {
-                            event_tx.send(AppEvent::Connected {
-                                session_id: session_id.clone(),
-                                channels: SessionChannels { session_id, input_tx, output_rx },
-                                server_banner: handle.banner.clone(),
-                            }).await.ok();
-                            // handle 存入 session_handles 用于后续 resize/disconnect
-                        }
-                        Err(e) => {
-                            event_tx.send(AppEvent::Error {
-                                session_id: Some(session_id),
-                                error: e.into(),
-                            }).await.ok();
+                        tokio::spawn(async move {
+                            let (input_tx, input_rx) = mpsc::channel(256);
+                            let (output_tx, output_rx) = mpsc::channel(256);
+
+                            match ssh_connect(&session_config, terminal_size, input_rx, output_tx).await {
+                                Ok(handle) => {
+                                    let sid = session_id.clone();
+                                    event_tx.send(AppEvent::Connected {
+                                        session_id: session_id.clone(),
+                                        channels: SessionChannels { session_id, input_tx, output_rx },
+                                        server_banner: handle.banner.clone(),
+                                    }).await.ok();
+                                    // 把句柄发回 backend_loop 主循环
+                                    internal_tx.send(InternalEvent::HandleReady {
+                                        session_id: sid,
+                                        handle,
+                                    }).await.ok();
+                                }
+                                Err(e) => {
+                                    event_tx.send(AppEvent::Error {
+                                        session_id: Some(session_id),
+                                        error: e.into(),
+                                    }).await.ok();
+                                }
+                            }
+                        });
+                    }
+
+                    AppCommand::OpenLocalPty { shell, terminal_size } => {
+                        // 类似 Connect，但创建 LocalPty 而非 SSH
+                        // 同样通过 internal_tx 发回 SessionHandle
+                    }
+
+                    AppCommand::Disconnect { session_id } => {
+                        if let Some(handle) = session_handles.remove(&session_id) {
+                            handle.disconnect().await.ok();
                         }
                     }
-                });
-            }
 
-            AppCommand::OpenLocalPty { shell, terminal_size } => {
-                // 类似 Connect，但创建 LocalPty 而非 SSH
-            }
+                    AppCommand::Resize { session_id, cols, rows } => {
+                        if let Some(handle) = session_handles.get(&session_id) {
+                            handle.resize(cols, rows).await.ok();
+                        }
+                    }
 
-            AppCommand::Disconnect { session_id } => {
-                if let Some(handle) = session_handles.remove(&session_id) {
-                    handle.disconnect().await.ok();
+                    // SFTP 命令: spawn 独立任务处理
+                    AppCommand::SftpListDir { session_id, path } => { /* ... */ }
+                    AppCommand::SftpUpload { .. } => { /* ... */ }
+                    AppCommand::SftpDownload { .. } => { /* ... */ }
+                    AppCommand::SftpFileOp { .. } => { /* ... */ }
+
+                    // 交互响应（转发到等待中的认证任务）
+                    AppCommand::HostKeyResponse { .. } => { /* ... */ }
+                    AppCommand::PasswordResponse { .. } => { /* ... */ }
                 }
             }
 
-            AppCommand::Resize { session_id, cols, rows } => {
-                if let Some(handle) = session_handles.get(&session_id) {
-                    handle.resize(cols, rows).await.ok();
+            // 处理 spawned 任务发回的内部事件
+            Some(internal) = internal_rx.recv() => {
+                match internal {
+                    InternalEvent::HandleReady { session_id, handle } => {
+                        session_handles.insert(session_id, handle);
+                    }
                 }
             }
 
-            // SFTP 命令: spawn 独立任务处理
-            AppCommand::SftpListDir { session_id, path } => { /* ... */ }
-            AppCommand::SftpUpload { .. } => { /* ... */ }
-            AppCommand::SftpDownload { .. } => { /* ... */ }
-            AppCommand::SftpFileOp { .. } => { /* ... */ }
-
-            // 交互响应（转发到等待中的认证任务）
-            AppCommand::HostKeyResponse { .. } => { /* ... */ }
-            AppCommand::PasswordResponse { .. } => { /* ... */ }
+            // 两个通道都关闭时退出
+            else => break,
         }
     }
 }
@@ -1014,14 +1046,19 @@ pub struct SessionList {
     pub list: Vec<SessionConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionConfig {
-    pub id: String,                       // UUID v4
+    #[serde(default)]
+    pub id: String,                       // UUID v4，默认空（创建时生成）
+    #[serde(default)]
     pub name: String,                     // 显示名称
+    #[serde(default)]
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,                        // 22
+    #[serde(default)]
     pub username: String,
+    #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
     pub startup_command: Option<String>,   // 连接后自动执行
@@ -1033,19 +1070,21 @@ pub struct SessionConfig {
     pub last_connected: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(tag = "type", rename_all = "lowercase")]
 pub enum AuthConfig {
-    #[serde(rename = "password")]
+    #[default]
     Password {
         /// MVP: 明文存储（后续版本迁移到 keyring）
         /// 字段可选——如果为空，连接时弹出密码输入框
+        #[serde(default)]
         password: Option<String>,
     },
-    #[serde(rename = "key")]
     Key {
+        #[serde(default)]
         key_path: String,
         /// 私钥密码短语（可选，同上）
+        #[serde(default)]
         passphrase: Option<String>,
     },
 }
@@ -1283,6 +1322,23 @@ pub enum TerminalError {
 
     #[error("PTY 写入失败: {0}")]
     PtyWrite(#[from] std::io::Error),
+}
+
+/// ===== PTY 错误（PtyBackend 使用）=====
+
+#[derive(Debug, thiserror::Error)]
+pub enum PtyError {
+    #[error("PTY creation failed: {0}")]
+    CreationFailed(String),
+
+    #[error("PTY process exited")]
+    ProcessExited,
+
+    #[error("PTY write error: {0}")]
+    WriteError(#[from] std::io::Error),
+
+    #[error("PTY resize failed: {0}")]
+    ResizeFailed(String),
 }
 
 /// ===== SFTP 错误 =====
@@ -1696,7 +1752,7 @@ impl App {
         event_rx: mpsc::Receiver<AppEvent>,
         runtime: tokio::runtime::Runtime,
     ) -> Self {
-        let config = ConfigManager::new().expect("无法初始化配置目录");
+        let config = ConfigManager::new().expect("Failed to initialize config directory");
         let settings = config.load_settings().unwrap_or_default();
         let sessions = config.load_sessions().unwrap_or_default();
         let theme = config.load_theme(&settings.app.theme)
@@ -1733,14 +1789,13 @@ impl eframe::App for App {
             self.handle_app_event(event);
         }
 
-        // 拉取每个标签的终端输出
+        // 拉取每个标签的终端输出（限 256KB/帧防阻塞渲染）
         for tab in &mut self.tabs {
-            let mut count = 0;
+            let mut total_bytes = 0usize;
             while let Ok(data) = tab.output_rx.try_recv() {
+                total_bytes += data.len();
                 tab.terminal.process_output(&data);
-                count += 1;
-                // 单帧最多处理 64 批数据，防止阻塞渲染
-                if count >= 64 { break; }
+                if total_bytes >= 256 * 1024 { break; }  // 剩余下一帧处理
             }
         }
 
@@ -1782,8 +1837,8 @@ impl eframe::App for App {
 
         // ===== Phase 3: 请求重绘 =====
         if !self.tabs.is_empty() {
-            // 有活跃终端时持续请求重绘
-            ctx.request_repaint();
+            // 有活跃终端时节流重绘（30fps 空闲，有新数据时 egui 自动立即重绘）
+            ctx.request_repaint_after(Duration::from_millis(33));
         }
     }
 }
@@ -2012,11 +2067,11 @@ impl App {
 
                 // 右键菜单
                 response.context_menu(|ui| {
-                    if ui.button("关闭").clicked() {
+                    if ui.button("Close").clicked() {
                         close_tab = Some(idx);
                         ui.close_menu();
                     }
-                    if ui.button("关闭其他").clicked() {
+                    if ui.button("Close Others").clicked() {
                         // 保留当前，关闭其他
                         ui.close_menu();
                     }
@@ -2108,7 +2163,7 @@ impl App {
     fn render_connect_dialog(&mut self, ctx: &egui::Context) {
         let ModalDialog::NewConnection(ref mut state) = self.modal else { return };
 
-        egui::Window::new("新建连接")
+        egui::Window::new("New Connection")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -2117,48 +2172,48 @@ impl App {
                     .num_columns(2)
                     .spacing([8.0, 8.0])
                     .show(ui, |ui| {
-                        ui.label("名称:");
+                        ui.label("Name:");
                         ui.text_edit_singleline(&mut state.name);
                         ui.end_row();
 
-                        ui.label("主机:");
+                        ui.label("Host:");
                         ui.text_edit_singleline(&mut state.host);
                         ui.end_row();
 
-                        ui.label("端口:");
+                        ui.label("Port:");
                         ui.add(egui::TextEdit::singleline(&mut state.port)
                             .desired_width(60.0));
                         ui.end_row();
 
-                        ui.label("用户名:");
+                        ui.label("Username:");
                         ui.text_edit_singleline(&mut state.username);
                         ui.end_row();
 
-                        ui.label("认证方式:");
+                        ui.label("Auth Type:");
                         ui.horizontal(|ui| {
                             ui.selectable_value(
                                 &mut state.auth_type,
-                                AuthType::Password, "密码"
+                                AuthType::Password, "Password"
                             );
                             ui.selectable_value(
                                 &mut state.auth_type,
-                                AuthType::Key, "密钥"
+                                AuthType::Key, "Key"
                             );
                         });
                         ui.end_row();
 
                         match state.auth_type {
                             AuthType::Password => {
-                                ui.label("密码:");
+                                ui.label("Password:");
                                 ui.add(egui::TextEdit::singleline(&mut state.password)
                                     .password(true));
                                 ui.end_row();
                             }
                             AuthType::Key => {
-                                ui.label("私钥路径:");
+                                ui.label("Key Path:");
                                 ui.horizontal(|ui| {
                                     ui.text_edit_singleline(&mut state.key_path);
-                                    if ui.button("浏览...").clicked() {
+                                    if ui.button("Browse...").clicked() {
                                         // 打开文件选择对话框
                                         if let Some(path) = rfd::FileDialog::new()
                                             .set_directory(
@@ -2177,7 +2232,7 @@ impl App {
                         }
 
                         ui.label("");
-                        ui.checkbox(&mut state.save_session, "保存会话");
+                        ui.checkbox(&mut state.save_session, "Save Session");
                         ui.end_row();
                     });
 
@@ -2189,10 +2244,10 @@ impl App {
                 ui.separator();
 
                 ui.horizontal(|ui| {
-                    if ui.button("连接").clicked() {
+                    if ui.button("Connect").clicked() {
                         self.do_connect();
                     }
-                    if ui.button("取消").clicked() {
+                    if ui.button("Cancel").clicked() {
                         self.modal = ModalDialog::None;
                     }
                 });
