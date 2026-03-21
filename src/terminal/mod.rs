@@ -1,2 +1,10 @@
 // src/terminal/mod.rs
-//! Terminal emulation - pure logic, no I/O
+mod grid;
+mod cell;
+mod cursor;
+mod mode;
+
+pub use grid::*;
+pub use cell::*;
+pub use cursor::*;
+pub use mode::*;
