@@ -2,7 +2,7 @@
 use bitflags::bitflags;
 
 bitflags! {
-    #[derive(Clone, Copy, Debug, Default)]
+    #[derive(Clone, Copy, Debug)]
     pub struct TerminalMode: u32 {
         const CURSOR_KEYS_APPLICATION = 0x0001;
         const LINE_FEED_NEW_LINE = 0x0002;
@@ -13,5 +13,11 @@ bitflags! {
         const ALTERNATE_SCREEN = 0x0040;
         const MOUSE_TRACKING = 0x0080;
         const BRACKETED_PASTE = 0x0100;
+    }
+}
+
+impl Default for TerminalMode {
+    fn default() -> Self {
+        Self::AUTO_WRAP | Self::CURSOR_VISIBLE
     }
 }

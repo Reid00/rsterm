@@ -46,14 +46,15 @@ pub struct Cell {
     pub bg: PackedColor,
     pub flags: CellFlags,
     pub width: u8,
+    _padding: [u8; 2],
 }
 
 impl Cell {
     pub fn new(ch: char) -> Self {
-        Self { char: ch, width: 1, ..Default::default() }
+        Self { char: ch, width: 1, _padding: [0; 2], ..Default::default() }
     }
 
     pub fn blank() -> Self {
-        Self { char: ' ', width: 1, ..Default::default() }
+        Self { char: ' ', width: 1, _padding: [0; 2], ..Default::default() }
     }
 }
