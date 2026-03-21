@@ -23,7 +23,7 @@ impl ConfigManager {
         Ok(Self { base_dir: base })
     }
 
-    fn initialize_dirs(base: &PathBuf) -> Result<(), ConfigError> {
+    fn initialize_dirs(base: &std::path::Path) -> Result<(), ConfigError> {
         fs::create_dir_all(base)?;
         fs::create_dir_all(base.join("themes"))?;
 
@@ -32,8 +32,7 @@ impl ConfigManager {
         let toml = toml::to_string_pretty(&settings)?;
         fs::write(base.join("config.toml"), toml)?;
 
-        // Write empty sessions file
-        fs::write(base.join("sessions.toml"), "[[sessions]]\n")?;
+        // Sessions file is optional - load_sessions handles missing file
 
         Ok(())
     }
@@ -75,6 +74,17 @@ impl ConfigManager {
             *existing = session.clone();
         } else {
             sessions.push(session.clone());
+        }
+        self.write_sessions(&sessions)
+    }
+
+    pub fn delete_session(&self, id: &str) -> Result<(), ConfigError> {
+        let mut sessions = self.load_sessions()?;
+        let initial_len = sessions.len();
+        sessions.retain(|s| s.id != id);
+        if sessions.len() == initial_len {
+            // Session not found - not an error, just no-op
+            return Ok(());
         }
         self.write_sessions(&sessions)
     }

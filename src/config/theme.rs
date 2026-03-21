@@ -65,6 +65,12 @@ impl Default for TerminalColorPalette {
     }
 }
 
+impl Default for Theme {
+    fn default() -> Self {
+        Self::default_dark()
+    }
+}
+
 impl Theme {
     pub fn default_dark() -> Self {
         Self {
