@@ -8,6 +8,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::error::PtyError;
+use crate::sftp::SftpClient;
 
 /// PTY backend trait - async push model
 #[async_trait::async_trait]
@@ -16,6 +17,17 @@ pub trait PtyBackend: Send + Sync + 'static {
     async fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyError>;
     fn is_alive(&self) -> bool;
     fn kill(&self);
+
+    /// Check if this backend supports SFTP (only SSH backends do)
+    fn supports_sftp(&self) -> bool {
+        false
+    }
+
+    /// Get an SFTP client (only implemented by SSH backends)
+    /// Returns None if not supported or if not yet initialized
+    async fn get_sftp(&self) -> Option<Arc<tokio::sync::Mutex<SftpClient>>> {
+        None
+    }
 }
 
 /// Local PTY implementation using portable-pty

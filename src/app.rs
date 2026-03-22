@@ -185,6 +185,55 @@ impl App {
                     }
                 }
             }
+            BackendEvent::SftpReady { session_id } => {
+                info!("SFTP ready for session: {}", session_id);
+                // SFTP is now available for this session
+                // The panel can be shown/used
+            }
+            BackendEvent::SftpError { session_id, error } => {
+                error!("SFTP error for session {}: {}", session_id, error);
+                // Update SFTP panel error state for the active tab
+                if let Some(idx) = self.active_tab_idx {
+                    if let Some(tab) = self.tabs.get_mut(idx) {
+                        if tab.session_id == session_id {
+                            tab.sftp_panel.error = Some(error);
+                            tab.sftp_panel.loading = false;
+                        }
+                    }
+                }
+            }
+            BackendEvent::SftpListResult { session_id, path, entries } => {
+                info!("SFTP list result for {} in session {}: {} entries", path, session_id, entries.len());
+                // Update the SFTP panel with the directory listing
+                if let Some(idx) = self.active_tab_idx {
+                    if let Some(tab) = self.tabs.get_mut(idx) {
+                        if tab.session_id == session_id {
+                            tab.sftp_panel.current_path = path;
+                            tab.sftp_panel.entries = entries;
+                            tab.sftp_panel.loading = false;
+                            tab.sftp_panel.error = None;
+                        }
+                    }
+                }
+            }
+            BackendEvent::SftpTransferProgress { session_id: _, transfer_id, bytes_transferred, total_bytes: _ } => {
+                // Update transfer progress
+                for transfer in &mut self.sftp_transfers {
+                    if transfer.id == transfer_id {
+                        transfer.update_progress(bytes_transferred);
+                    }
+                }
+            }
+            BackendEvent::SftpTransferComplete { session_id: _, transfer_id, success, error } => {
+                // Handle transfer completion
+                if success {
+                    info!("Transfer {} completed successfully", transfer_id);
+                } else {
+                    error!("Transfer {} failed: {:?}", transfer_id, error);
+                }
+                // Remove from active transfers
+                self.sftp_transfers.retain(|t| t.id != transfer_id);
+            }
         }
     }
 
@@ -597,11 +646,21 @@ impl App {
             if let Some(tab) = self.tabs.get_mut(idx) {
                 if matches!(tab.kind, TabKind::Ssh { .. }) {
                     tab.sftp_panel.visible = !tab.sftp_panel.visible;
-                    // Initialize path if opening panel for the first time
-                    if tab.sftp_panel.visible && tab.sftp_panel.current_path.is_empty() {
-                        tab.sftp_panel.current_path = "/".to_string();
-                        tab.sftp_panel.loading = true;
-                        // TODO: Send SFTP list command
+                    // Initialize SFTP and path if opening panel for the first time
+                    if tab.sftp_panel.visible {
+                        // Send SFTP init command
+                        let session_id = tab.session_id.clone();
+                        let _ = self.command_tx.try_send(AppCommand::SftpInit { session_id });
+
+                        if tab.sftp_panel.current_path.is_empty() {
+                            tab.sftp_panel.current_path = "/".to_string();
+                            tab.sftp_panel.loading = true;
+                            // Send SFTP list command
+                            let _ = self.command_tx.try_send(AppCommand::SftpListDir {
+                                session_id: tab.session_id.clone(),
+                                path: "/".to_string(),
+                            });
+                        }
                     }
                 }
             }
@@ -612,11 +671,15 @@ impl App {
     fn sftp_navigate_to(&mut self, path: String) {
         if let Some(idx) = self.active_tab_idx {
             if let Some(tab) = self.tabs.get_mut(idx) {
-                tab.sftp_panel.current_path = path;
+                tab.sftp_panel.current_path = path.clone();
                 tab.sftp_panel.loading = true;
                 tab.sftp_panel.selected = None;
                 tab.sftp_panel.error = None;
-                // TODO: Send SFTP list command
+                // Send SFTP list command
+                let _ = self.command_tx.try_send(AppCommand::SftpListDir {
+                    session_id: tab.session_id.clone(),
+                    path,
+                });
             }
         }
     }
@@ -724,7 +787,11 @@ impl App {
                 if let Some(idx) = active_idx {
                     if let Some(tab) = self.tabs.get_mut(idx) {
                         tab.sftp_panel.loading = true;
-                        // TODO: Send SFTP refresh command
+                        // Send SFTP list command for current path
+                        let _ = self.command_tx.try_send(AppCommand::SftpListDir {
+                            session_id: tab.session_id.clone(),
+                            path: tab.sftp_panel.current_path.clone(),
+                        });
                     }
                 }
             }
@@ -778,7 +845,11 @@ impl App {
                         if let Some(tab) = self.tabs.get_mut(idx) {
                             tab.sftp_panel.error = None;
                             tab.sftp_panel.loading = true;
-                            // TODO: Send SFTP list command
+                            // Send SFTP list command
+                            let _ = self.command_tx.try_send(AppCommand::SftpListDir {
+                                session_id: tab.session_id.clone(),
+                                path: tab.sftp_panel.current_path.clone(),
+                            });
                         }
                     }
                 }
@@ -1398,5 +1469,13 @@ impl eframe::App for App {
             }
             _ => {}
         }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        info!("App dropping, sending shutdown command");
+        // Send shutdown command to backend
+        let _ = self.command_tx.try_send(AppCommand::Shutdown);
     }
 }

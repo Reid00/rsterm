@@ -5,6 +5,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::backend::{PtyBackend, SshConnectionConfig};
 use crate::config::SessionConfig;
+use crate::state::FileEntryInfo;
 
 /// Handle to a terminal session
 pub struct SessionHandle {
@@ -43,6 +44,37 @@ pub enum AppCommand {
     CloseSession {
         session_id: String,
     },
+    /// Initialize SFTP for an SSH session
+    SftpInit {
+        session_id: String,
+    },
+    /// List directory contents via SFTP
+    SftpListDir {
+        session_id: String,
+        path: String,
+    },
+    /// Download a file via SFTP
+    SftpDownload {
+        session_id: String,
+        remote_path: String,
+        local_path: String,
+    },
+    /// Upload a file via SFTP
+    SftpUpload {
+        session_id: String,
+        local_path: String,
+        remote_path: String,
+    },
+    /// Create directory via SFTP
+    SftpMkdir {
+        session_id: String,
+        path: String,
+    },
+    /// Delete file or directory via SFTP
+    SftpDelete {
+        session_id: String,
+        path: String,
+    },
     /// Shutdown the backend
     Shutdown,
 }
@@ -62,5 +94,34 @@ pub enum BackendEvent {
     /// Session created
     SessionCreated {
         session_id: String,
+    },
+    /// SFTP initialized for session
+    SftpReady {
+        session_id: String,
+    },
+    /// SFTP initialization failed
+    SftpError {
+        session_id: String,
+        error: String,
+    },
+    /// SFTP directory listing result
+    SftpListResult {
+        session_id: String,
+        path: String,
+        entries: Vec<FileEntryInfo>,
+    },
+    /// SFTP transfer progress
+    SftpTransferProgress {
+        session_id: String,
+        transfer_id: u64,
+        bytes_transferred: u64,
+        total_bytes: u64,
+    },
+    /// SFTP transfer complete
+    SftpTransferComplete {
+        session_id: String,
+        transfer_id: u64,
+        success: bool,
+        error: Option<String>,
     },
 }

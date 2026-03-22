@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 
 use crate::backend::PtyBackend;
 use crate::error::{PtyError, SshError};
+use crate::sftp::SftpClient;
 use crate::ssh::{HostKeyVerification, KnownHosts};
 
 /// SSH connection configuration for creating a session
@@ -53,6 +54,8 @@ pub struct SshPty {
     /// Runtime handle for async operations
     #[allow(dead_code)]
     runtime: Arc<tokio::runtime::Runtime>,
+    /// SFTP client (created during session setup, cached here)
+    sftp: Arc<tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<SftpClient>>>>>,
 }
 
 /// Client handler for russh
@@ -163,9 +166,23 @@ impl SshPty {
         let alive = Arc::new(AtomicBool::new(true));
         let (command_tx, command_rx) = tokio_mpsc::channel::<SshCommand>(64);
 
+        // Create SFTP client storage
+        let sftp: Arc<tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<SftpClient>>>>> = Arc::new(tokio::sync::Mutex::new(None));
+
         // Spawn the actor task that owns the channel
         let alive_clone = alive.clone();
+        let sftp_clone = sftp.clone();
         rt.spawn(async move {
+            // Create SFTP client
+            match SftpClient::new(&session).await {
+                Ok(sftp_client) => {
+                    *sftp_clone.lock().await = Some(Arc::new(tokio::sync::Mutex::new(sftp_client)));
+                    info!("SFTP client initialized");
+                }
+                Err(e) => {
+                    warn!("Failed to create SFTP client: {}", e);
+                }
+            }
             ssh_actor(channel, session, command_rx, output_tx, alive_clone).await;
         });
 
@@ -173,7 +190,14 @@ impl SshPty {
             alive,
             command_tx,
             runtime: rt,
+            sftp,
         })
+    }
+
+    /// Try to get an SFTP client from this SSH session (internal method)
+    async fn try_get_sftp(&self) -> Option<Arc<tokio::sync::Mutex<SftpClient>>> {
+        let guard = self.sftp.lock().await;
+        guard.clone()
     }
 }
 
@@ -447,6 +471,14 @@ impl PtyBackend for SshPty {
         let _ = self.command_tx.try_send(SshCommand::Kill);
 
         self.alive.store(false, Ordering::Relaxed);
+    }
+
+    fn supports_sftp(&self) -> bool {
+        true
+    }
+
+    async fn get_sftp(&self) -> Option<Arc<tokio::sync::Mutex<SftpClient>>> {
+        self.try_get_sftp().await
     }
 }
 
