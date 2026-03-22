@@ -85,3 +85,225 @@ impl Grid {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal::cell::CellFlags;
+
+    #[test]
+    fn test_grid_new() {
+        let grid = Grid::new(80, 24);
+        assert_eq!(grid.col_count(), 80);
+        assert_eq!(grid.row_count(), 24);
+    }
+
+    #[test]
+    fn test_cell_get_set() {
+        let mut grid = Grid::new(10, 5);
+
+        // Test cell() - panics on out of bounds
+        assert_eq!(grid.cell(0, 0).char, ' ');
+
+        // Test cell_mut() - modify a cell
+        {
+            let cell = grid.cell_mut(2, 3);
+            cell.char = 'X';
+            cell.fg = crate::terminal::cell::PackedColor::indexed(1);
+        }
+
+        // Verify modification
+        let cell = grid.cell(2, 3);
+        assert_eq!(cell.char, 'X');
+        assert!(cell.fg.is_indexed());
+        assert_eq!(cell.fg.indexed_index(), 1);
+    }
+
+    #[test]
+    fn test_cell_with_bounds_check() {
+        let mut grid = Grid::new(10, 5);
+
+        // Test get_cell() - returns None on out of bounds
+        assert!(grid.get_cell(0, 0).is_some());
+        assert!(grid.get_cell(100, 0).is_none());
+        assert!(grid.get_cell(0, 100).is_none());
+
+        // Test get_cell_mut() - returns None on out of bounds
+        assert!(grid.get_cell_mut(0, 0).is_some());
+        assert!(grid.get_cell_mut(100, 0).is_none());
+        assert!(grid.get_cell_mut(0, 100).is_none());
+
+        // Modify through get_cell_mut()
+        if let Some(cell) = grid.get_cell_mut(1, 1) {
+            cell.char = 'A';
+            cell.flags.set(CellFlags::BOLD, true);
+        }
+
+        let cell = grid.cell(1, 1);
+        assert_eq!(cell.char, 'A');
+        assert!(cell.flags.contains(CellFlags::BOLD));
+    }
+
+    #[test]
+    fn test_resize_larger() {
+        let mut grid = Grid::new(10, 5);
+
+        // Fill grid with content
+        for row in 0..5 {
+            for col in 0..10 {
+                let cell = grid.cell_mut(row, col);
+                cell.char = char::from(b'A' + (row * 10 + col) as u8);
+            }
+        }
+
+        // Resize larger
+        grid.resize(20, 10);
+
+        assert_eq!(grid.col_count(), 20);
+        assert_eq!(grid.row_count(), 10);
+
+        // Original content should be preserved
+        for row in 0..5 {
+            for col in 0..10 {
+                let expected = char::from(b'A' + (row * 10 + col) as u8);
+                assert_eq!(grid.cell(row, col).char, expected);
+            }
+        }
+
+        // New cells should be blank
+        for row in 0..5 {
+            for col in 10..20 {
+                assert_eq!(grid.cell(row, col).char, ' ');
+            }
+        }
+        for row in 5..10 {
+            for col in 0..20 {
+                assert_eq!(grid.cell(row, col).char, ' ');
+            }
+        }
+    }
+
+    #[test]
+    fn test_resize_smaller() {
+        let mut grid = Grid::new(20, 10);
+
+        // Fill grid with content
+        for row in 0..10 {
+            for col in 0..20 {
+                let cell = grid.cell_mut(row, col);
+                cell.char = char::from(b'A' + (row * 20 + col) as u8 % 26);
+            }
+        }
+
+        // Resize smaller
+        grid.resize(10, 5);
+
+        assert_eq!(grid.col_count(), 10);
+        assert_eq!(grid.row_count(), 5);
+
+        // Remaining content should be preserved
+        for row in 0..5 {
+            for col in 0..10 {
+                let expected = char::from(b'A' + (row * 20 + col) as u8 % 26);
+                assert_eq!(grid.cell(row, col).char, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn test_resize_same_size() {
+        let mut grid = Grid::new(10, 5);
+
+        // Fill grid with content
+        for row in 0..5 {
+            for col in 0..10 {
+                let cell = grid.cell_mut(row, col);
+                cell.char = char::from(b'0' + col as u8 % 10);
+            }
+        }
+
+        // Resize to same size
+        grid.resize(10, 5);
+
+        // Content should be unchanged
+        for row in 0..5 {
+            for col in 0..10 {
+                let expected = char::from(b'0' + col as u8 % 10);
+                assert_eq!(grid.cell(row, col).char, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn test_clear() {
+        let mut grid = Grid::new(10, 5);
+
+        // Fill grid with content
+        for row in 0..5 {
+            for col in 0..10 {
+                let cell = grid.cell_mut(row, col);
+                cell.char = 'X';
+                cell.fg = crate::terminal::cell::PackedColor::indexed(1);
+                cell.flags.set(CellFlags::BOLD, true);
+            }
+        }
+
+        // Clear grid
+        grid.clear();
+
+        // All cells should be blank
+        for row in 0..5 {
+            for col in 0..10 {
+                let cell = grid.cell(row, col);
+                assert_eq!(cell.char, ' ');
+                assert!(cell.fg.is_default());
+                assert!(!cell.flags.contains(CellFlags::BOLD));
+            }
+        }
+    }
+
+    #[test]
+    fn test_row_access() {
+        let mut grid = Grid::new(10, 5);
+
+        // Modify a row
+        {
+            let row = grid.row_mut(2);
+            for cell in row.cells_mut() {
+                cell.char = 'R';
+            }
+        }
+
+        // Verify through row()
+        let row = grid.row(2);
+        for cell in row.cells() {
+            assert_eq!(cell.char, 'R');
+        }
+
+        // Other rows should still be blank
+        let row = grid.row(1);
+        for cell in row.cells() {
+            assert_eq!(cell.char, ' ');
+        }
+    }
+
+    #[test]
+    fn test_empty_grid() {
+        let grid = Grid::new(0, 0);
+        assert_eq!(grid.col_count(), 0);
+        assert_eq!(grid.row_count(), 0);
+    }
+
+    #[test]
+    fn test_grid_clone() {
+        let mut grid1 = Grid::new(10, 5);
+        grid1.cell_mut(0, 0).char = 'A';
+
+        let grid2 = grid1.clone();
+        assert_eq!(grid2.cell(0, 0).char, 'A');
+
+        // Modifying grid1 should not affect grid2
+        grid1.cell_mut(0, 0).char = 'B';
+        assert_eq!(grid2.cell(0, 0).char, 'A');
+    }
+}
