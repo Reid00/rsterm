@@ -15,12 +15,14 @@ pub trait PtyBackend: Send + Sync + 'static {
     async fn write(&self, data: &[u8]) -> Result<(), PtyError>;
     async fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyError>;
     fn is_alive(&self) -> bool;
+    fn kill(&self);
 }
 
 /// Local PTY implementation using portable-pty
 pub struct LocalPty {
     pair: Arc<Mutex<PtyPair>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    child: Arc<Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>>,
     alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -41,9 +43,12 @@ impl LocalPty {
             })
             .map_err(|e| PtyError::CreationFailed(e.to_string()))?;
 
-        // Spawn shell
-        let cmd = CommandBuilder::new(shell);
-        let _child = pair
+        // Spawn shell with proper environment
+        let mut cmd = CommandBuilder::new(shell);
+        for (key, value) in crate::platform::pty_environment() {
+            cmd.env(key, value);
+        }
+        let child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| PtyError::CreationFailed(e.to_string()))?;
@@ -67,7 +72,7 @@ impl LocalPty {
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
-                        alive_clone.store(false, std::sync::atomic::Ordering::SeqCst);
+                        alive_clone.store(false, std::sync::atomic::Ordering::Relaxed);
                         break;
                     }
                     Ok(n) => {
@@ -77,7 +82,7 @@ impl LocalPty {
                     }
                     Err(e) => {
                         tracing::error!("PTY read error: {}", e);
-                        alive_clone.store(false, std::sync::atomic::Ordering::SeqCst);
+                        alive_clone.store(false, std::sync::atomic::Ordering::Relaxed);
                         break;
                     }
                 }
@@ -87,6 +92,7 @@ impl LocalPty {
         Ok(Self {
             pair: Arc::new(Mutex::new(pair)),
             writer: Arc::new(Mutex::new(writer)),
+            child: Arc::new(Mutex::new(Some(child))),
             alive,
         })
     }
@@ -115,6 +121,12 @@ impl PtyBackend for LocalPty {
     }
 
     fn is_alive(&self) -> bool {
-        self.alive.load(std::sync::atomic::Ordering::SeqCst)
+        self.alive.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn kill(&self) {
+        if let Some(mut child) = self.child.lock().take() {
+            let _ = child.kill();
+        }
     }
 }

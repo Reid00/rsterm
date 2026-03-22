@@ -132,6 +132,9 @@ pub struct SessionConfig {
     pub startup_command: Option<String>,
     #[serde(default)]
     pub environment: HashMap<String, String>,
+    /// Shell to use for local PTY sessions (None uses platform default)
+    #[serde(default)]
+    pub shell: Option<String>,
 }
 
 fn default_port() -> u16 { 22 }
