@@ -18,6 +18,7 @@ pub struct SessionHandle {
 pub enum AppCommand {
     /// Create a new session
     CreateSession {
+        session_id: String,
         config: SessionConfig,
         respond_to: tokio_mpsc::Sender<Result<String, String>>,
     },

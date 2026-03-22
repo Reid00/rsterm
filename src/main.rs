@@ -1,5 +1,6 @@
 // src/main.rs
 use rsterm::app::App;
+use rsterm::backend::backend_loop;
 use rsterm::channel::AppChannels;
 
 fn main() -> eframe::Result<()> {
@@ -19,14 +20,11 @@ fn main() -> eframe::Result<()> {
         .build()
         .expect("Failed to create Tokio runtime");
 
-    // Spawn backend loop (placeholder for now)
-    // Split channels for async backend task
+    // Spawn backend loop
     let event_tx = channels.event_tx.clone();
     let command_rx = channels.command_rx;
     runtime.spawn(async move {
-        // TODO: backend_loop(command_rx, event_tx)
-        let _ = (command_rx, event_tx);
-        std::future::pending::<()>().await;
+        backend_loop(command_rx, event_tx).await;
     });
 
     let options = eframe::NativeOptions {

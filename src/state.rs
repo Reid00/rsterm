@@ -4,8 +4,6 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use tokio::sync::mpsc;
-
 use crate::channel::SessionId;
 
 pub type TabId = u64;
@@ -41,9 +39,7 @@ pub struct Tab {
     pub kind: TabKind,
     pub session_id: SessionId,
     pub status: ConnectionState,
-    pub input_tx: mpsc::Sender<Vec<u8>>,
-    pub output_rx: mpsc::Receiver<Vec<u8>>,
-    // pub terminal: Terminal,  // Added in M2
+    // Terminal rendering is handled in App::sessions HashMap
     // pub sftp: Option<SftpState>,  // Added in M6
 }
 

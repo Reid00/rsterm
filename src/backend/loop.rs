@@ -26,8 +26,8 @@ pub async fn backend_loop(
             // Handle commands from UI
             Some(cmd) = command_rx.recv() => {
                 match cmd {
-                    AppCommand::CreateSession { config, respond_to } => {
-                        let result = create_session(&mut sessions, &event_tx, config).await;
+                    AppCommand::CreateSession { session_id, config, respond_to } => {
+                        let result = create_session(&mut sessions, &event_tx, session_id, config).await;
                         let _ = respond_to.send(result.map(|id| id).map_err(|e| e.to_string())).await;
                     }
                     AppCommand::WriteInput { session_id, data } => {
@@ -61,7 +61,14 @@ pub async fn backend_loop(
                 }
             }
 
-            else => break,
+            else => {
+                // Channel closed, clean up all sessions
+                for session in sessions.values() {
+                    session.backend.kill();
+                }
+                info!("Backend shutting down (channel closed)");
+                break;
+            }
         }
     }
 
@@ -71,9 +78,9 @@ pub async fn backend_loop(
 async fn create_session(
     sessions: &mut HashMap<String, SessionHandle>,
     event_tx: &tokio_mpsc::Sender<BackendEvent>,
+    session_id: String,
     config: SessionConfig,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let session_id = uuid::Uuid::new_v4().to_string();
 
     // Create output channel for this session
     let (output_tx, mut output_rx) = tokio_mpsc::channel(PTY_CHANNEL_CAPACITY);

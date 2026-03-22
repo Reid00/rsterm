@@ -42,8 +42,25 @@ impl Grid {
     pub fn row(&self, idx: usize) -> &Row { &self.rows[idx] }
     pub fn row_mut(&mut self, idx: usize) -> &mut Row { &mut self.rows[idx] }
 
-    pub fn cell(&self, row: usize, col: usize) -> &Cell { &self.rows[row].cells[col] }
-    pub fn cell_mut(&mut self, row: usize, col: usize) -> &mut Cell { &mut self.rows[row].cells[col] }
+    /// Get a cell without bounds checking. Panics if out of bounds.
+    pub fn cell(&self, row: usize, col: usize) -> &Cell {
+        &self.rows[row].cells[col]
+    }
+
+    /// Get a mutable cell without bounds checking. Panics if out of bounds.
+    pub fn cell_mut(&mut self, row: usize, col: usize) -> &mut Cell {
+        &mut self.rows[row].cells[col]
+    }
+
+    /// Get a cell with bounds checking. Returns None if out of bounds.
+    pub fn get_cell(&self, row: usize, col: usize) -> Option<&Cell> {
+        self.rows.get(row).and_then(|r| r.cells.get(col))
+    }
+
+    /// Get a mutable cell with bounds checking. Returns None if out of bounds.
+    pub fn get_cell_mut(&mut self, row: usize, col: usize) -> Option<&mut Cell> {
+        self.rows.get_mut(row).and_then(|r| r.cells.get_mut(col))
+    }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
         self.cols = cols;
