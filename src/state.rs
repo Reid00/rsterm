@@ -1,7 +1,6 @@
 // src/state.rs
 //! Application state management
 
-use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::channel::SessionId;
@@ -41,14 +40,82 @@ pub struct Tab {
     pub session_id: SessionId,
     pub status: ConnectionState,
     // Terminal rendering is handled in App::sessions HashMap
-    // pub sftp: Option<SftpState>,  // Added in M6
+    /// SFTP panel state (only for SSH sessions)
+    pub sftp_panel: SftpPanelState,
 }
 
-pub struct SftpState {
-    pub local_path: PathBuf,
-    pub remote_path: String,
+/// SFTP panel state for file browsing UI
+#[derive(Debug, Clone)]
+pub struct SftpPanelState {
+    pub visible: bool,
+    pub current_path: String,
+    pub entries: Vec<FileEntryInfo>,
+    pub selected: Option<usize>,
     pub loading: bool,
     pub error: Option<String>,
+}
+
+impl Default for SftpPanelState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            current_path: String::new(),
+            entries: Vec::new(),
+            selected: None,
+            loading: false,
+            error: None,
+        }
+    }
+}
+
+/// File entry for display in the SFTP panel
+#[derive(Debug, Clone)]
+pub struct FileEntryInfo {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: Option<String>,
+}
+
+/// Active SFTP transfer with progress tracking
+#[derive(Debug, Clone)]
+pub struct SftpTransfer {
+    pub id: u64,
+    pub filename: String,
+    pub direction: TransferDirection,
+    pub progress: f32,
+    pub bytes_transferred: u64,
+    pub total_bytes: u64,
+}
+
+/// Direction of file transfer
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TransferDirection {
+    Upload,
+    Download,
+}
+
+impl SftpTransfer {
+    /// Create a new transfer
+    pub fn new(id: u64, filename: String, direction: TransferDirection, total_bytes: u64) -> Self {
+        Self {
+            id,
+            filename,
+            direction,
+            progress: 0.0,
+            bytes_transferred: 0,
+            total_bytes,
+        }
+    }
+
+    /// Update transfer progress
+    pub fn update_progress(&mut self, bytes_transferred: u64) {
+        self.bytes_transferred = bytes_transferred;
+        if self.total_bytes > 0 {
+            self.progress = bytes_transferred as f32 / self.total_bytes as f32;
+        }
+    }
 }
 
 pub enum ModalDialog {

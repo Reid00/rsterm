@@ -10,7 +10,7 @@ use tracing::{error, info};
 
 use crate::backend::{AppCommand, BackendEvent, SshAuthMethod, SshConnectionConfig};
 use crate::config::{AppSettings, ConfigManager, Theme};
-use crate::state::{AuthMethodUi, ConnectionState, ModalDialog, Tab, TabKind};
+use crate::state::{AuthMethodUi, ConnectionState, FileEntryInfo, ModalDialog, SftpPanelState, SftpTransfer, Tab, TabKind, TransferDirection};
 use crate::terminal::Terminal;
 
 pub type SessionId = String;
@@ -64,6 +64,10 @@ pub struct App {
 
     // Context menu state
     context_menu_tab_id: Option<u64>,
+
+    // SFTP state
+    sftp_transfers: Vec<SftpTransfer>,
+    sftp_transfer_id_counter: u64,
 }
 
 impl App {
@@ -93,6 +97,8 @@ impl App {
             notifications: VecDeque::new(),
             session_panel_width: 200.0,
             context_menu_tab_id: None,
+            sftp_transfers: Vec::new(),
+            sftp_transfer_id_counter: 0,
         }
     }
 
@@ -135,6 +141,7 @@ impl App {
                     },
                     session_id,
                     status: ConnectionState::Connecting,
+                    sftp_panel: SftpPanelState::default(),
                 };
                 self.tabs.push(tab);
                 self.active_tab_idx = Some(self.tabs.len() - 1);
@@ -559,6 +566,7 @@ impl App {
                     },
                     session_id,
                     status: ConnectionState::Connecting,
+                    sftp_panel: SftpPanelState::default(),
                 };
                 self.tabs.push(tab);
                 self.active_tab_idx = Some(self.tabs.len() - 1);
@@ -570,6 +578,396 @@ impl App {
                     .push_back(format!("Failed to create SSH session: {}", e));
             }
         }
+    }
+
+    /// Check if SFTP panel should be visible for the current tab
+    fn is_sftp_available(&self) -> bool {
+        if let Some(idx) = self.active_tab_idx {
+            if let Some(tab) = self.tabs.get(idx) {
+                return matches!(tab.kind, TabKind::Ssh { .. })
+                    && matches!(tab.status, ConnectionState::Connected { .. });
+            }
+        }
+        false
+    }
+
+    /// Toggle SFTP panel visibility
+    fn toggle_sftp_panel(&mut self) {
+        if let Some(idx) = self.active_tab_idx {
+            if let Some(tab) = self.tabs.get_mut(idx) {
+                if matches!(tab.kind, TabKind::Ssh { .. }) {
+                    tab.sftp_panel.visible = !tab.sftp_panel.visible;
+                    // Initialize path if opening panel for the first time
+                    if tab.sftp_panel.visible && tab.sftp_panel.current_path.is_empty() {
+                        tab.sftp_panel.current_path = "/".to_string();
+                        tab.sftp_panel.loading = true;
+                        // TODO: Send SFTP list command
+                    }
+                }
+            }
+        }
+    }
+
+    /// Navigate to a directory in SFTP panel
+    fn sftp_navigate_to(&mut self, path: String) {
+        if let Some(idx) = self.active_tab_idx {
+            if let Some(tab) = self.tabs.get_mut(idx) {
+                tab.sftp_panel.current_path = path;
+                tab.sftp_panel.loading = true;
+                tab.sftp_panel.selected = None;
+                tab.sftp_panel.error = None;
+                // TODO: Send SFTP list command
+            }
+        }
+    }
+
+    /// Navigate up one directory in SFTP panel
+    fn sftp_navigate_up(&mut self) {
+        if let Some(idx) = self.active_tab_idx {
+            // Get parent path first
+            let parent_path = self.tabs.get(idx).and_then(|tab| {
+                let current = &tab.sftp_panel.current_path;
+                if current != "/" && !current.is_empty() {
+                    current.rfind('/').map(|i| {
+                        if i == 0 { "/".to_string() } else { current[..i].to_string() }
+                    })
+                } else {
+                    None
+                }
+            });
+
+            if let Some(path) = parent_path {
+                self.sftp_navigate_to(path);
+            }
+        }
+    }
+
+    /// Render the SFTP panel
+    fn render_sftp_panel(&mut self, ctx: &egui::Context) {
+        let active_idx = self.active_tab_idx;
+        let is_ssh_session = active_idx.map_or(false, |idx| {
+            self.tabs.get(idx).map_or(false, |t| matches!(t.kind, TabKind::Ssh { .. }))
+        });
+
+        if !is_ssh_session {
+            return;
+        }
+
+        // Get panel visibility
+        let visible = active_idx.map_or(false, |idx| {
+            self.tabs.get(idx).map_or(false, |t| t.sftp_panel.visible)
+        });
+
+        if !visible {
+            return;
+        }
+
+        egui::SidePanel::right("sftp_panel")
+            .default_width(350.0)
+            .min_width(250.0)
+            .show(ctx, |ui| {
+                // Header with close button
+                ui.horizontal(|ui| {
+                    ui.heading("SFTP");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("X").clicked() {
+                            self.toggle_sftp_panel();
+                        }
+                    });
+                });
+
+                ui.separator();
+
+                // Address bar
+                self.render_sftp_address_bar(ui);
+
+                ui.separator();
+
+                // Toolbar
+                self.render_sftp_toolbar(ui);
+
+                ui.separator();
+
+                // File list
+                self.render_sftp_file_list(ui);
+
+                ui.separator();
+
+                // Transfer progress
+                self.render_sftp_transfers(ui);
+            });
+    }
+
+    /// Render SFTP address bar
+    fn render_sftp_address_bar(&mut self, ui: &mut egui::Ui) {
+        let active_idx = self.active_tab_idx;
+
+        ui.horizontal(|ui| {
+            // Up button
+            if ui.small_button("⬆").on_hover_text("Go to parent directory").clicked() {
+                self.sftp_navigate_up();
+            }
+
+            // Path display/edit
+            if let Some(idx) = active_idx {
+                if let Some(tab) = self.tabs.get_mut(idx) {
+                    let mut path = tab.sftp_panel.current_path.clone();
+                    ui.add(egui::TextEdit::singleline(&mut path).desired_width(f32::INFINITY));
+                    if path != tab.sftp_panel.current_path {
+                        tab.sftp_panel.current_path = path;
+                    }
+                }
+            }
+
+            // Refresh button
+            if ui.small_button("🔄").on_hover_text("Refresh directory").clicked() {
+                if let Some(idx) = active_idx {
+                    if let Some(tab) = self.tabs.get_mut(idx) {
+                        tab.sftp_panel.loading = true;
+                        // TODO: Send SFTP refresh command
+                    }
+                }
+            }
+        });
+    }
+
+    /// Render SFTP toolbar
+    fn render_sftp_toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.small_button("📤 Upload").clicked() {
+                // TODO: Open file picker and initiate upload
+                self.notifications.push_back("Upload feature coming soon".to_string());
+            }
+            if ui.small_button("📁 New Folder").clicked() {
+                // TODO: Show new folder dialog
+                self.notifications.push_back("New folder feature coming soon".to_string());
+            }
+            if ui.small_button("🗑 Delete").clicked() {
+                // TODO: Delete selected item
+                self.notifications.push_back("Delete feature coming soon".to_string());
+            }
+        });
+    }
+
+    /// Render SFTP file list
+    fn render_sftp_file_list(&mut self, ui: &mut egui::Ui) {
+        let active_idx = self.active_tab_idx;
+
+        // Get current state info
+        let (loading, _has_error, error_msg) = active_idx.map_or((false, false, None), |idx| {
+            self.tabs.get(idx).map_or((false, false, None), |t| {
+                (t.sftp_panel.loading, t.sftp_panel.error.is_some(), t.sftp_panel.error.clone())
+            })
+        });
+
+        if loading {
+            ui.vertical_centered(|ui| {
+                ui.add_space(50.0);
+                ui.spinner();
+                ui.label("Loading...");
+            });
+            return;
+        }
+
+        if let Some(err) = error_msg {
+            ui.vertical_centered(|ui| {
+                ui.add_space(20.0);
+                ui.colored_label(egui::Color32::RED, &err);
+                if ui.button("Retry").clicked() {
+                    if let Some(idx) = active_idx {
+                        if let Some(tab) = self.tabs.get_mut(idx) {
+                            tab.sftp_panel.error = None;
+                            tab.sftp_panel.loading = true;
+                            // TODO: Send SFTP list command
+                        }
+                    }
+                }
+            });
+            return;
+        }
+
+        // Get entries and selection
+        let entries: Vec<FileEntryInfo> = active_idx.map_or(Vec::new(), |idx| {
+            self.tabs.get(idx).map_or(Vec::new(), |t| t.sftp_panel.entries.clone())
+        });
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // Header row
+            ui.horizontal(|ui| {
+                ui.set_min_width(ui.available_width());
+                ui.label(egui::RichText::new("Name").strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                    ui.label(egui::RichText::new("Size").strong());
+                });
+            });
+            ui.separator();
+
+            if entries.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(30.0);
+                    ui.label("Empty directory");
+                    ui.label("Use Upload to add files");
+                });
+                return;
+            }
+
+            // File entries
+            for (i, entry) in entries.iter().enumerate() {
+                let is_selected = active_idx.map_or(false, |idx| {
+                    self.tabs.get(idx).map_or(false, |t| t.sftp_panel.selected == Some(i))
+                });
+
+                let response = ui.selectable_label(is_selected, "");
+                let rect = response.rect;
+
+                // Custom painting
+                let painter = ui.painter_at(rect);
+
+                if is_selected {
+                    painter.rect_filled(
+                        rect,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(60, 120, 200, 50),
+                    );
+                }
+
+                // Icon and name
+                let icon = if entry.is_dir { "📁" } else { "📄" };
+                let mut x_offset = rect.min.x + 4.0;
+                let y_center = rect.center().y;
+
+                painter.text(
+                    egui::pos2(x_offset, y_center),
+                    egui::Align2::LEFT_CENTER,
+                    icon,
+                    egui::FontId::proportional(14.0),
+                    egui::Color32::WHITE,
+                );
+                x_offset += 20.0;
+
+                painter.text(
+                    egui::pos2(x_offset, y_center),
+                    egui::Align2::LEFT_CENTER,
+                    &entry.name,
+                    egui::FontId::proportional(12.0),
+                    ui.style().visuals.text_color(),
+                );
+
+                // Size on right
+                let size_text = if entry.is_dir {
+                    "<DIR>".to_string()
+                } else {
+                    format_size(entry.size)
+                };
+                painter.text(
+                    egui::pos2(rect.max.x - 4.0, y_center),
+                    egui::Align2::RIGHT_CENTER,
+                    size_text,
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::GRAY,
+                );
+
+                // Handle interaction
+                if response.clicked() {
+                    if let Some(idx) = active_idx {
+                        if let Some(tab) = self.tabs.get_mut(idx) {
+                            tab.sftp_panel.selected = Some(i);
+                        }
+                    }
+                }
+
+                // Double-click to enter directory
+                if response.double_clicked() && entry.is_dir {
+                    self.sftp_navigate_to(entry.path.clone());
+                }
+
+                // Context menu on right-click
+                response.context_menu(|ui| {
+                    if ui.button("Download").clicked() {
+                        if !entry.is_dir {
+                            // TODO: Start download
+                            self.notifications.push_back(format!("Download: {}", entry.name));
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Delete").clicked() {
+                        // TODO: Delete file
+                        self.notifications.push_back(format!("Delete: {}", entry.name));
+                        ui.close_menu();
+                    }
+                    if ui.button("Rename").clicked() {
+                        // TODO: Rename dialog
+                        self.notifications.push_back(format!("Rename: {}", entry.name));
+                        ui.close_menu();
+                    }
+                });
+            }
+        });
+    }
+
+    /// Render active SFTP transfers
+    fn render_sftp_transfers(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Transfers").strong());
+
+        if self.sftp_transfers.is_empty() {
+            ui.label("No active transfers");
+            return;
+        }
+
+        let mut completed = Vec::new();
+
+        for transfer in &self.sftp_transfers {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    let icon = match transfer.direction {
+                        TransferDirection::Upload => "📤",
+                        TransferDirection::Download => "📥",
+                    };
+                    ui.label(icon);
+                    ui.label(&transfer.filename);
+                });
+
+                // Progress bar
+                let progress = transfer.progress.min(1.0);
+                let progress_text = format!("{:.0}%", progress * 100.0);
+                ui.add(
+                    egui::ProgressBar::new(progress)
+                        .text(progress_text)
+                );
+
+                // Bytes transferred
+                let transferred = format_size(transfer.bytes_transferred);
+                let total = format_size(transfer.total_bytes);
+                ui.label(format!("{} / {}", transferred, total));
+
+                // Mark completed
+                if progress >= 1.0 {
+                    completed.push(transfer.id);
+                }
+            });
+        }
+
+        // Remove completed transfers after a short delay (for now, immediately)
+        for id in completed {
+            self.sftp_transfers.retain(|t| t.id != id);
+        }
+    }
+}
+
+/// Format file size in human-readable format
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
     }
 }
 
@@ -617,6 +1015,17 @@ impl eframe::App for App {
                 }
                 if ui.button("New SSH Session").clicked() {
                     self.show_new_session_dialog();
+                }
+
+                // SFTP toggle button (only visible for SSH sessions)
+                if self.is_sftp_available() {
+                    let sftp_visible = self.active_tab_idx.map_or(false, |idx| {
+                        self.tabs.get(idx).map_or(false, |t| t.sftp_panel.visible)
+                    });
+                    let btn_text = if sftp_visible { "Hide SFTP" } else { "Show SFTP" };
+                    if ui.button(btn_text).clicked() {
+                        self.toggle_sftp_panel();
+                    }
                 }
             });
         });
@@ -978,6 +1387,9 @@ impl eframe::App for App {
                 }
             }
         });
+
+        // Render SFTP panel
+        self.render_sftp_panel(ctx);
 
         // Render modal dialogs
         match &self.modal {
