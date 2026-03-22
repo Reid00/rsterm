@@ -15,6 +15,13 @@ use crate::terminal::Terminal;
 
 pub type SessionId = String;
 
+/// Actions for the context menu
+enum ContextMenuAction {
+    Disconnect(String),
+    Reconnect(usize, TabKind),
+    CloseTab(usize, String),
+}
+
 /// A terminal session with its associated terminal state
 pub struct TerminalSession {
     pub session_id: SessionId,
@@ -54,6 +61,9 @@ pub struct App {
     modal: ModalDialog,
     notifications: VecDeque<String>,
     session_panel_width: f32,
+
+    // Context menu state
+    context_menu_tab_id: Option<u64>,
 }
 
 impl App {
@@ -82,6 +92,7 @@ impl App {
             modal: ModalDialog::None,
             notifications: VecDeque::new(),
             session_panel_width: 200.0,
+            context_menu_tab_id: None,
         }
     }
 
@@ -615,15 +626,241 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui.heading("Sessions");
                 ui.separator();
-                for (i, tab) in self.tabs.iter().enumerate() {
-                    let is_active = self.active_tab_idx == Some(i);
-                    if ui.selectable_label(is_active, &tab.title).clicked() {
-                        self.active_tab_idx = Some(i);
-                    }
-                }
+
                 if self.tabs.is_empty() {
                     ui.label("No sessions");
                     ui.label("Press Ctrl+Shift+T");
+                } else {
+                    // Collect tab info first to avoid borrowing issues
+                    let tab_info: Vec<(usize, u64, String, TabKind, ConnectionState)> = self.tabs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| (i, t.id, t.title.clone(), t.kind.clone(), t.status.clone()))
+                        .collect();
+
+                    for (i, tab_id, title, kind, status) in tab_info {
+                        let is_active = self.active_tab_idx == Some(i);
+
+                        // Create a unique ID for this tab item
+                        let _tab_id_str = format!("tab_{}", tab_id);
+
+                        // Build the tab label with status indicator and type badge
+                        let (status_indicator, status_color) = match &status {
+                            ConnectionState::Connecting => ("*".to_string(), egui::Color32::from_rgb(255, 200, 0)),
+                            ConnectionState::Connected { .. } => ("*".to_string(), egui::Color32::from_rgb(0, 200, 0)),
+                            ConnectionState::Disconnected => ("*".to_string(), egui::Color32::from_rgb(200, 50, 50)),
+                            ConnectionState::Reconnecting { attempt, .. } => {
+                                (format!("R{}", attempt), egui::Color32::from_rgb(255, 150, 0))
+                            }
+                            ConnectionState::Error { .. } => ("!".to_string(), egui::Color32::from_rgb(255, 50, 50)),
+                        };
+
+                        // Type badge
+                        let (type_badge, type_color) = match &kind {
+                            TabKind::Local { .. } => ("L", egui::Color32::from_rgb(100, 150, 200)),
+                            TabKind::Ssh { .. } => ("S", egui::Color32::from_rgb(150, 100, 200)),
+                        };
+
+                        // Draw the tab item with interactive area
+                        let response = ui.selectable_label(is_active, "");
+                        let rect = response.rect;
+
+                        // Custom painting for the tab item
+                        if is_active {
+                            ui.painter().rect_filled(
+                                rect,
+                                0.0,
+                                egui::Color32::from_rgba_unmultiplied(60, 120, 200, 50),
+                            );
+                        }
+
+                        let painter = ui.painter_at(rect);
+
+                        // Layout: [status] [type] [title]
+                        let mut x_offset = rect.min.x + 4.0;
+                        let y_center = rect.center().y;
+
+                        // Status indicator (animated for connecting)
+                        let indicator_text = match &status {
+                            ConnectionState::Connecting => {
+                                // Animate dots based on time
+                                let time = ui.input(|i| i.time);
+                                let dots = ((time * 2.0) as i32 % 4) as usize;
+                                let dot_str = ".".repeat(dots);
+                                format!("{}{}", status_indicator, dot_str)
+                            }
+                            _ => status_indicator.clone(),
+                        };
+
+                        painter.text(
+                            egui::pos2(x_offset, y_center),
+                            egui::Align2::LEFT_CENTER,
+                            indicator_text,
+                            egui::FontId::proportional(12.0),
+                            status_color,
+                        );
+                        x_offset += 12.0;
+
+                        // Type badge
+                        let badge_rect = egui::Rect::from_min_size(
+                            egui::pos2(x_offset, rect.min.y + 2.0),
+                            egui::vec2(14.0, rect.height() - 4.0),
+                        );
+                        painter.rect_filled(badge_rect, 2.0, type_color);
+                        painter.text(
+                            badge_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            type_badge,
+                            egui::FontId::proportional(10.0),
+                            egui::Color32::WHITE,
+                        );
+                        x_offset += 18.0;
+
+                        // Title text
+                        let title_text = if is_active {
+                            egui::RichText::new(&title).strong()
+                        } else {
+                            egui::RichText::new(&title)
+                        };
+                        painter.text(
+                            egui::pos2(x_offset, y_center),
+                            egui::Align2::LEFT_CENTER,
+                            title_text.text(),
+                            egui::FontId::proportional(12.0),
+                            ui.style().visuals.text_color(),
+                        );
+
+                        // Handle click
+                        if response.clicked() {
+                            self.active_tab_idx = Some(i);
+                        }
+
+                        // Handle right-click for context menu
+                        if response.secondary_clicked() {
+                            self.context_menu_tab_id = Some(tab_id);
+                        }
+
+                        // Handle double-click to rename (optional - placeholder for MVP)
+                        if response.double_clicked() {
+                            // TODO: Implement rename functionality
+                            tracing::info!("Double-clicked tab {} for rename", tab_id);
+                        }
+                    }
+                }
+
+                // Render context menu if open
+                if let Some(menu_tab_id) = self.context_menu_tab_id {
+                    let mut close_menu = false;
+                    let mut action: Option<ContextMenuAction> = None;
+
+                    // Find the tab info
+                    if let Some((idx, tab)) = self.tabs.iter().enumerate().find(|(_, t)| t.id == menu_tab_id) {
+                        let tab_status = tab.status.clone();
+                        let tab_session_id = tab.session_id.clone();
+
+                        egui::Window::new("Context Menu")
+                            .title_bar(false)
+                            .resizable(false)
+                            .collapsible(false)
+                            .anchor(egui::Align2::LEFT_TOP, egui::vec2(0.0, 0.0))
+                            .show(ctx, |ui| {
+                                ui.set_min_width(120.0);
+
+                                // Show appropriate options based on connection state
+                                match &tab_status {
+                                    ConnectionState::Connected { .. } => {
+                                        if ui.button("Disconnect").clicked() {
+                                            action = Some(ContextMenuAction::Disconnect(tab_session_id.clone()));
+                                            close_menu = true;
+                                        }
+                                    }
+                                    ConnectionState::Disconnected | ConnectionState::Error { .. } => {
+                                        if ui.button("Reconnect").clicked() {
+                                            action = Some(ContextMenuAction::Reconnect(idx, tab.kind.clone()));
+                                            close_menu = true;
+                                        }
+                                    }
+                                    ConnectionState::Connecting => {
+                                        ui.label("Connecting...");
+                                    }
+                                    ConnectionState::Reconnecting { .. } => {
+                                        ui.label("Reconnecting...");
+                                    }
+                                }
+
+                                if ui.button("Close Tab").clicked() {
+                                    action = Some(ContextMenuAction::CloseTab(idx, tab_session_id.clone()));
+                                    close_menu = true;
+                                }
+
+                                // Click outside to close
+                                if ui.button("Cancel").clicked() {
+                                    close_menu = true;
+                                }
+                            });
+
+                        // Handle actions
+                        if let Some(act) = action {
+                            match act {
+                                ContextMenuAction::Disconnect(session_id) => {
+                                    let _ = self.command_tx.try_send(AppCommand::CloseSession {
+                                        session_id,
+                                    });
+                                }
+                                ContextMenuAction::Reconnect(idx, kind) => {
+                                    // For reconnect, we need to create a new session with the same config
+                                    // For now, handle based on tab kind
+                                    match kind {
+                                        TabKind::Local { shell } => {
+                                            self.create_local_session(if shell == "default" { None } else { Some(&shell) });
+                                            // Remove the old tab
+                                            if idx < self.tabs.len() {
+                                                self.tabs.remove(idx);
+                                                self.active_tab_idx = if self.tabs.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(self.tabs.len().saturating_sub(1))
+                                                };
+                                            }
+                                        }
+                                        TabKind::Ssh { .. } => {
+                                            // For SSH, we'd need to store credentials or prompt again
+                                            // For now, show notification
+                                            self.notifications.push_back(
+                                                "Reconnect for SSH requires re-entering credentials. Use New SSH Session.".to_string()
+                                            );
+                                        }
+                                    }
+                                }
+                                ContextMenuAction::CloseTab(idx, session_id) => {
+                                    // Send close command
+                                    let _ = self.command_tx.try_send(AppCommand::CloseSession {
+                                        session_id: session_id.clone(),
+                                    });
+                                    // Remove session and tab
+                                    self.sessions.remove(&session_id);
+                                    if idx < self.tabs.len() {
+                                        self.tabs.remove(idx);
+                                        self.active_tab_idx = if self.tabs.is_empty() {
+                                            None
+                                        } else {
+                                            Some(idx.saturating_sub(1).min(self.tabs.len() - 1))
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Close menu on click outside
+                    if ctx.input(|i| i.pointer.any_click()) && ctx.dragged_id().is_none() {
+                        // Check if we clicked outside the context menu
+                        close_menu = true;
+                    }
+
+                    if close_menu {
+                        self.context_menu_tab_id = None;
+                    }
                 }
             });
 

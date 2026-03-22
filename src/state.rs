@@ -28,6 +28,7 @@ pub enum ConnectionState {
     },
 }
 
+#[derive(Debug, Clone)]
 pub enum TabKind {
     Ssh { session_config_id: String },
     Local { shell: String },
