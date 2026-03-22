@@ -10,10 +10,11 @@ use std::sync::Arc;
 use russh::client::{Config, Handle, Handler, Msg};
 use russh::{Channel, ChannelMsg, Disconnect};
 use tokio::sync::mpsc as tokio_mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::backend::PtyBackend;
 use crate::error::{PtyError, SshError};
+use crate::ssh::{HostKeyVerification, KnownHosts};
 
 /// SSH connection configuration for creating a session
 pub struct SshConnectionConfig {
@@ -21,6 +22,9 @@ pub struct SshConnectionConfig {
     pub port: u16,
     pub username: String,
     pub auth: SshAuthMethod,
+    /// Optional known hosts database for host key verification.
+    /// If None, host key verification is skipped (insecure).
+    pub known_hosts: Option<KnownHosts>,
 }
 
 /// SSH authentication method
@@ -50,7 +54,28 @@ pub struct SshPty {
 }
 
 /// Client handler for russh
-struct Client;
+struct Client {
+    /// Host being connected to
+    host: String,
+    /// Port being connected to
+    port: u16,
+    /// Known hosts database for verification
+    known_hosts: Option<KnownHosts>,
+    /// Result of host key verification (set during check_server_key)
+    verification_result: Option<HostKeyVerification>,
+}
+
+impl Client {
+    /// Create a new client handler
+    fn new(host: String, port: u16, known_hosts: Option<KnownHosts>) -> Self {
+        Self {
+            host,
+            port,
+            known_hosts,
+            verification_result: None,
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl Handler for Client {
@@ -58,11 +83,54 @@ impl Handler for Client {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh_keys::key::PublicKey,
+        server_public_key: &russh_keys::key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        // TODO: Implement proper known hosts verification
-        // For now, accept all keys (should be configurable in production)
-        Ok(true)
+        match &self.known_hosts {
+            Some(known_hosts) => {
+                let result = known_hosts.verify(&self.host, self.port, server_public_key);
+
+                match &result {
+                    HostKeyVerification::Trusted => {
+                        info!("Host key verified for {}:{}", self.host, self.port);
+                        self.verification_result = Some(result);
+                        Ok(true)
+                    }
+                    HostKeyVerification::Unknown => {
+                        // TOFU: Trust On First Use - accept unknown hosts
+                        info!(
+                            "Unknown host {}:{}, accepting key (TOFU)",
+                            self.host, self.port
+                        );
+                        // Add to pending so it's available for this session
+                        known_hosts.add_pending(&self.host, self.port, server_public_key.clone());
+                        // Save to known_hosts file
+                        if let Err(e) = known_hosts.add(&self.host, self.port, server_public_key) {
+                            warn!("Failed to save known_hosts: {}", e);
+                        }
+                        self.verification_result = Some(result);
+                        Ok(true)
+                    }
+                    HostKeyVerification::Changed { line } => {
+                        // Key changed - potential MITM, reject
+                        warn!(
+                            "Host key changed for {}:{} at line {}, rejecting connection",
+                            self.host, self.port, line
+                        );
+                        self.verification_result = Some(result);
+                        Ok(false)
+                    }
+                }
+            }
+            None => {
+                // No known_hosts configured - accept all keys (insecure)
+                warn!(
+                    "No known_hosts configured, accepting key for {}:{} (insecure)",
+                    self.host, self.port
+                );
+                self.verification_result = Some(HostKeyVerification::Unknown);
+                Ok(true)
+            }
+        }
     }
 }
 
@@ -210,11 +278,18 @@ async fn connect_and_setup_pty(
     // Configure SSH session
     let ssh_config = Arc::new(Config::default());
 
+    // Create client handler with known hosts
+    let client = Client::new(
+        config.host.clone(),
+        config.port,
+        config.known_hosts.clone(),
+    );
+
     // Connect to server and perform handshake
     let mut session = russh::client::connect(
         ssh_config,
         (config.host.as_str(), config.port),
-        Client,
+        client,
     )
     .await
     .map_err(|e| SshError::Protocol(format!("Connection failed: {}", e)))?;

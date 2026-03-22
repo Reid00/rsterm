@@ -9,3 +9,4 @@ pub mod error;
 pub mod platform;
 pub mod fonts;
 pub mod app;
+pub mod ssh;
