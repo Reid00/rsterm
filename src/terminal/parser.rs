@@ -21,6 +21,8 @@ pub struct ParserState {
     alt_grid: Grid,
     /// Cursor position
     cursor: Cursor,
+    /// Saved cursor for main screen (used when switching to/from alternate screen)
+    saved_main_cursor: Cursor,
     /// Terminal modes
     mode: TerminalMode,
     /// Pending attributes for next cell
@@ -40,6 +42,7 @@ impl ParserState {
             grid,
             alt_grid,
             cursor: Cursor::new(),
+            saved_main_cursor: Cursor::new(),
             mode: TerminalMode::default(),
             pending_attrs: CellAttrs::default(),
             scroll_top: 0,
@@ -54,6 +57,10 @@ impl ParserState {
 
     /// Scroll up within the scroll region
     fn scroll_up(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+
         let top = self.scroll_top;
         let bottom = self.scroll_bottom;
 
@@ -190,6 +197,9 @@ impl ParserState {
                 1 => {
                     self.pending_attrs.flags.set(CellFlags::BOLD, true);
                 }
+                2 => {
+                    self.pending_attrs.flags.set(CellFlags::DIM, true);
+                }
                 3 => {
                     self.pending_attrs.flags.set(CellFlags::ITALIC, true);
                 }
@@ -199,8 +209,13 @@ impl ParserState {
                 7 => {
                     self.pending_attrs.flags.set(CellFlags::REVERSE, true);
                 }
+                9 => {
+                    self.pending_attrs.flags.set(CellFlags::STRIKETHROUGH, true);
+                }
                 22 => {
+                    // Clear both bold and dim
                     self.pending_attrs.flags.set(CellFlags::BOLD, false);
+                    self.pending_attrs.flags.set(CellFlags::DIM, false);
                 }
                 23 => {
                     self.pending_attrs.flags.set(CellFlags::ITALIC, false);
@@ -210,6 +225,9 @@ impl ParserState {
                 }
                 27 => {
                     self.pending_attrs.flags.set(CellFlags::REVERSE, false);
+                }
+                29 => {
+                    self.pending_attrs.flags.set(CellFlags::STRIKETHROUGH, false);
                 }
                 30..=37 => {
                     // Standard foreground colors
@@ -304,8 +322,9 @@ impl ParserState {
                     self.mode.set(TerminalMode::CURSOR_VISIBLE, true);
                 }
                 1049 => {
-                    // Alternate screen buffer
+                    // Alternate screen buffer - save main screen cursor
                     if !self.mode.contains(TerminalMode::ALTERNATE_SCREEN) {
+                        self.saved_main_cursor = self.cursor;
                         self.mode.set(TerminalMode::ALTERNATE_SCREEN, true);
                         self.alt_grid.clear();
                         self.cursor.row = 0;
@@ -342,10 +361,9 @@ impl ParserState {
                     self.mode.set(TerminalMode::CURSOR_VISIBLE, false);
                 }
                 1049 => {
-                    // Exit alternate screen buffer
+                    // Exit alternate screen buffer - restore main screen cursor
                     self.mode.set(TerminalMode::ALTERNATE_SCREEN, false);
-                    self.cursor.row = 0;
-                    self.cursor.col = 0;
+                    self.cursor = self.saved_main_cursor;
                 }
                 _ => {}
             }
@@ -450,7 +468,7 @@ impl Perform for ParserState {
         let scroll_bottom = self.scroll_bottom;
         let attrs = self.pending_attrs;
 
-        // Handle auto-wrap
+        // Handle auto-wrap (cursor past end of line)
         if auto_wrap && self.cursor.col >= max_col {
             self.cursor.col = 0;
             self.cursor.row += 1;
@@ -458,6 +476,23 @@ impl Perform for ParserState {
                 self.cursor.row = scroll_bottom - 1;
                 // scroll_up needs its own mutable borrow, so call it before getting grid
                 self.scroll_up(1);
+            }
+        }
+
+        // Handle wide character at line end - needs room for continuation cell
+        if width > 1 && self.cursor.col + width > max_col {
+            // Not enough room for wide character on this line
+            if auto_wrap {
+                // Wrap to next line first
+                self.cursor.col = 0;
+                self.cursor.row += 1;
+                if self.cursor.row >= scroll_bottom {
+                    self.cursor.row = scroll_bottom - 1;
+                    self.scroll_up(1);
+                }
+            } else {
+                // No auto-wrap - skip the character
+                return;
             }
         }
 
@@ -482,7 +517,7 @@ impl Perform for ParserState {
         // Advance cursor
         self.cursor.col += 1;
 
-        // Handle wide characters - skip next cell
+        // Handle wide characters - mark next cell as continuation
         if width > 1 && self.cursor.col < max_col {
             // Mark the next cell as a continuation of wide char
             let next_col = self.cursor.col;
