@@ -4,7 +4,9 @@
 mod handle;
 mod pty;
 mod r#loop;
+mod ssh;
 
 pub use handle::*;
 pub use pty::*;
 pub use r#loop::*;
+pub use ssh::*;
