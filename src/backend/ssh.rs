@@ -17,6 +17,7 @@ use crate::error::{PtyError, SshError};
 use crate::ssh::{HostKeyVerification, KnownHosts};
 
 /// SSH connection configuration for creating a session
+#[derive(Debug)]
 pub struct SshConnectionConfig {
     pub host: String,
     pub port: u16,
@@ -28,6 +29,7 @@ pub struct SshConnectionConfig {
 }
 
 /// SSH authentication method
+#[derive(Debug)]
 pub enum SshAuthMethod {
     Password(String),
     Key {

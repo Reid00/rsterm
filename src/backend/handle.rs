@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc as tokio_mpsc;
 
-use crate::backend::PtyBackend;
+use crate::backend::{PtyBackend, SshConnectionConfig};
 use crate::config::SessionConfig;
 
 /// Handle to a terminal session
@@ -16,10 +16,16 @@ pub struct SessionHandle {
 /// Commands from the UI to the backend
 #[derive(Debug)]
 pub enum AppCommand {
-    /// Create a new session
+    /// Create a new local session
     CreateSession {
         session_id: String,
         config: SessionConfig,
+        respond_to: tokio_mpsc::Sender<Result<String, String>>,
+    },
+    /// Create a new SSH session
+    CreateSshSession {
+        session_id: String,
+        ssh_config: SshConnectionConfig,
         respond_to: tokio_mpsc::Sender<Result<String, String>>,
     },
     /// Write input to a session

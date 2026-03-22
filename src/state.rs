@@ -53,6 +53,17 @@ pub struct SftpState {
 pub enum ModalDialog {
     None,
     NewConnection(NewConnectionState),
+    NewSession {
+        name: String,
+        host: String,
+        port: u16,
+        username: String,
+        auth_method: AuthMethodUi,
+        password: String,
+        key_path: String,
+        key_passphrase: String,
+        error: Option<String>,
+    },
     Settings,
     HostKeyConfirm {
         host: String,
@@ -85,4 +96,13 @@ pub enum AuthType {
     #[default]
     Password,
     Key,
+}
+
+/// Authentication method for UI selection in the New Session dialog
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum AuthMethodUi {
+    #[default]
+    Password,
+    KeyFile,
+    Agent,
 }
