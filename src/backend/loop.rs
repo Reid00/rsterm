@@ -173,8 +173,8 @@ async fn create_ssh_session(
     // Create output channel for this session
     let (output_tx, mut output_rx) = tokio_mpsc::channel(PTY_CHANNEL_CAPACITY);
 
-    // Create the SSH PTY backend
-    let backend = Arc::new(SshPty::new(&ssh_config, 80, 24, output_tx)?);
+    // Create the SSH PTY backend (async version)
+    let backend = Arc::new(SshPty::new_async(&ssh_config, 80, 24, output_tx).await?);
 
     // Create a SessionConfig for the handle (with SSH info)
     let config = SessionConfig {
@@ -234,6 +234,8 @@ async fn handle_sftp_init(
     event_tx: &tokio_mpsc::Sender<BackendEvent>,
     session_id: String,
 ) {
+    info!("SFTP init requested for session: {}", session_id);
+
     // First, check if session exists and get the backend
     let backend = {
         let session = match sessions.get(&session_id) {
@@ -245,13 +247,27 @@ async fn handle_sftp_init(
         };
 
         // Check if SFTP is already initialized
-        if session.sftp.is_some() {
-            let _ = event_tx.send(BackendEvent::SftpReady { session_id }).await;
+        if let Some(sftp) = &session.sftp {
+            info!("SFTP already initialized for session: {}", session_id);
+            // SFTP already initialized, get cwd and send ready event
+            let sftp_clone = sftp.clone();
+            let event_tx_clone = event_tx.clone();
+            let session_id_clone = session_id.clone();
+            tokio::spawn(async move {
+                let sftp_guard = sftp_clone.lock().await;
+                let cwd = sftp_guard.pwd().to_string();
+                info!("SFTP ready with cwd: {}", cwd);
+                let _ = event_tx_clone.send(BackendEvent::SftpReady {
+                    session_id: session_id_clone,
+                    cwd,
+                }).await;
+            });
             return;
         }
 
         // Check if backend supports SFTP
         if !session.handle.backend.supports_sftp() {
+            error!("SFTP is not supported for this session type");
             let _ = event_tx.send(BackendEvent::SftpError {
                 session_id,
                 error: "SFTP is not supported for this session type".to_string(),
@@ -262,19 +278,51 @@ async fn handle_sftp_init(
         session.handle.backend.clone()
     };
 
-    // Get SFTP client from backend
-    match backend.get_sftp().await {
+    // Try to get SFTP client from backend with retries
+    let mut retries = 0;
+    let max_retries = 10;
+    let mut sftp_client = None;
+
+    while retries < max_retries {
+        match backend.get_sftp().await {
+            Some(client) => {
+                sftp_client = Some(client);
+                break;
+            }
+            None => {
+                retries += 1;
+                info!("SFTP client not ready yet, retry {} of {}", retries, max_retries);
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+
+    match sftp_client {
         Some(sftp_client) => {
+            info!("SFTP client obtained for session: {}", session_id);
             // Store the SFTP client in the session
             if let Some(session) = sessions.get_mut(&session_id) {
-                session.sftp = Some(sftp_client);
+                session.sftp = Some(sftp_client.clone());
             }
-            let _ = event_tx.send(BackendEvent::SftpReady { session_id }).await;
+
+            // Get current working directory and send ready event
+            let event_tx_clone = event_tx.clone();
+            let session_id_clone = session_id.clone();
+            tokio::spawn(async move {
+                let sftp_guard = sftp_client.lock().await;
+                let cwd = sftp_guard.pwd().to_string();
+                info!("SFTP ready with cwd: {}", cwd);
+                let _ = event_tx_clone.send(BackendEvent::SftpReady {
+                    session_id: session_id_clone,
+                    cwd,
+                }).await;
+            });
         }
         None => {
+            error!("SFTP client failed to initialize after {} retries", max_retries);
             let _ = event_tx.send(BackendEvent::SftpError {
                 session_id,
-                error: "SFTP client not yet initialized or unavailable".to_string(),
+                error: "SFTP client failed to initialize. The SSH server may not support SFTP.".to_string(),
             }).await;
         }
     }
@@ -287,6 +335,8 @@ async fn handle_sftp_list_dir(
     session_id: String,
     path: String,
 ) {
+    info!("SFTP list dir requested: {} in session {}", path, session_id);
+
     let session = match sessions.get_mut(&session_id) {
         Some(s) => s,
         None => {
@@ -298,6 +348,7 @@ async fn handle_sftp_list_dir(
     let sftp = match &session.sftp {
         Some(s) => s.clone(),
         None => {
+            error!("SFTP not initialized for session: {}", session_id);
             let _ = event_tx.send(BackendEvent::SftpError {
                 session_id,
                 error: "SFTP not initialized".to_string(),
@@ -311,9 +362,12 @@ async fn handle_sftp_list_dir(
     let path_clone = path.clone();
 
     tokio::spawn(async move {
+        info!("Acquiring SFTP lock for listing: {}", path_clone);
         let mut sftp_guard = sftp.lock().await;
+        info!("SFTP lock acquired, listing directory: {}", path_clone);
         match sftp_guard.list_dir(&path_clone).await {
             Ok(entries) => {
+                info!("Successfully listed directory: {} entries", entries.len());
                 let file_infos: Vec<FileEntryInfo> = entries
                     .into_iter()
                     .map(|e| FileEntryInfo {
@@ -335,6 +389,7 @@ async fn handle_sftp_list_dir(
                 }).await;
             }
             Err(e) => {
+                error!("Failed to list directory {}: {}", path_clone, e);
                 let _ = event_tx_clone.send(BackendEvent::SftpError {
                     session_id: session_id_clone,
                     error: e.to_string(),
@@ -400,6 +455,8 @@ async fn handle_sftp_upload(
     local_path: String,
     remote_path: String,
 ) {
+    info!("SFTP upload requested: {} -> {} in session {}", local_path, remote_path, session_id);
+
     let session = match sessions.get_mut(&session_id) {
         Some(s) => s,
         None => {
@@ -411,6 +468,7 @@ async fn handle_sftp_upload(
     let sftp = match &session.sftp {
         Some(s) => s.clone(),
         None => {
+            error!("SFTP not initialized for session: {}", session_id);
             let _ = event_tx.send(BackendEvent::SftpError {
                 session_id,
                 error: "SFTP not initialized".to_string(),
@@ -424,11 +482,13 @@ async fn handle_sftp_upload(
 
     tokio::spawn(async move {
         let mut sftp_guard = sftp.lock().await;
+        info!("Starting upload: {} -> {}", local_path, remote_path);
         match sftp_guard.upload(&local_path, &remote_path).await {
             Ok(()) => {
                 info!("Upload complete: {} -> {}", local_path, remote_path);
             }
             Err(e) => {
+                error!("Upload failed: {} -> {}: {}", local_path, remote_path, e);
                 let _ = event_tx_clone.send(BackendEvent::SftpError {
                     session_id: session_id_clone,
                     error: format!("Upload failed: {}", e),
@@ -445,6 +505,8 @@ async fn handle_sftp_mkdir(
     session_id: String,
     path: String,
 ) {
+    info!("SFTP mkdir requested: {} in session {}", path, session_id);
+
     let session = match sessions.get_mut(&session_id) {
         Some(s) => s,
         None => {
@@ -456,6 +518,7 @@ async fn handle_sftp_mkdir(
     let sftp = match &session.sftp {
         Some(s) => s.clone(),
         None => {
+            error!("SFTP not initialized for session: {}", session_id);
             let _ = event_tx.send(BackendEvent::SftpError {
                 session_id,
                 error: "SFTP not initialized".to_string(),
@@ -466,14 +529,17 @@ async fn handle_sftp_mkdir(
 
     let event_tx_clone = event_tx.clone();
     let session_id_clone = session_id.clone();
+    let path_clone = path.clone();
 
     tokio::spawn(async move {
         let mut sftp_guard = sftp.lock().await;
-        match sftp_guard.mkdir(&path).await {
+        info!("Attempting to create directory: {}", path_clone);
+        match sftp_guard.mkdir(&path_clone).await {
             Ok(()) => {
-                info!("Directory created: {}", path);
+                info!("Directory created successfully: {}", path_clone);
             }
             Err(e) => {
+                error!("Failed to create directory {}: {}", path_clone, e);
                 let _ = event_tx_clone.send(BackendEvent::SftpError {
                     session_id: session_id_clone,
                     error: format!("Failed to create directory: {}", e),
@@ -526,4 +592,58 @@ async fn handle_sftp_delete(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{LocalPty, PtyBackend};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_handle_sftp_init_session_not_found() {
+        let (event_tx, mut event_rx) = tokio_mpsc::channel(16);
+        let mut sessions: HashMap<String, SessionState> = HashMap::new();
+
+        handle_sftp_init(&mut sessions, &event_tx, "nonexistent".to_string()).await;
+
+        // Should not send any event (session doesn't exist)
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_sftp_list_dir_not_initialized() {
+        let (event_tx, mut event_rx) = tokio_mpsc::channel(16);
+        let mut sessions: HashMap<String, SessionState> = HashMap::new();
+
+        let (output_tx, _) = tokio_mpsc::channel(16);
+        let backend: Arc<dyn PtyBackend> =
+            Arc::new(LocalPty::new("bash", 80, 24, output_tx).unwrap());
+
+        sessions.insert(
+            "test".to_string(),
+            SessionState {
+                handle: SessionHandle {
+                    id: "test".to_string(),
+                    config: Default::default(),
+                    backend,
+                },
+                sftp: None, // No SFTP initialized
+            },
+        );
+
+        handle_sftp_list_dir(&mut sessions, &event_tx, "test".to_string(), "/".to_string()).await;
+
+        let event = event_rx.recv().await.unwrap();
+        match event {
+            BackendEvent::SftpError { error, .. } => {
+                assert!(error.contains("not initialized"))
+            }
+            _ => panic!("Expected SftpError event"),
+        }
+    }
 }
