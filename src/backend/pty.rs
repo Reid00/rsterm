@@ -57,9 +57,17 @@ impl LocalPty {
 
         // Spawn shell with proper environment
         let mut cmd = CommandBuilder::new(shell);
+
+        // Add shell arguments (e.g., -NoLogo for PowerShell)
+        for arg in crate::platform::shell_args() {
+            cmd.arg(arg);
+        }
+
+        // Add standard terminal environment variables
         for (key, value) in crate::platform::pty_environment() {
             cmd.env(key, value);
         }
+
         let child = pair
             .slave
             .spawn_command(cmd)
@@ -88,7 +96,8 @@ impl LocalPty {
                         break;
                     }
                     Ok(n) => {
-                        if output_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        let data = &buf[..n];
+                        if output_tx.blocking_send(data.to_vec()).is_err() {
                             break;
                         }
                     }

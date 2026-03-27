@@ -12,6 +12,35 @@ pub struct AppSettings {
     pub ssh: SshConfig,
     #[serde(default)]
     pub sftp: SftpConfig,
+    #[serde(default)]
+    pub ui: UiStateConfig,
+}
+
+/// UI state that should persist between sessions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiStateConfig {
+    #[serde(default = "default_session_panel_width")]
+    pub session_panel_width: f32,
+    #[serde(default = "default_sftp_panel_width")]
+    pub sftp_panel_width: f32,
+    #[serde(default = "default_true")]
+    pub local_group_open: bool,
+    #[serde(default = "default_true")]
+    pub ssh_group_open: bool,
+}
+
+fn default_session_panel_width() -> f32 { 200.0 }
+fn default_sftp_panel_width() -> f32 { 200.0 }
+
+impl Default for UiStateConfig {
+    fn default() -> Self {
+        Self {
+            session_panel_width: default_session_panel_width(),
+            sftp_panel_width: default_sftp_panel_width(),
+            local_group_open: true,
+            ssh_group_open: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

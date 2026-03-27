@@ -98,6 +98,8 @@ pub enum BackendEvent {
     /// SFTP initialized for session
     SftpReady {
         session_id: String,
+        /// Current working directory from SFTP session
+        cwd: String,
     },
     /// SFTP initialization failed
     SftpError {

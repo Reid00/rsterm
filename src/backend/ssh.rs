@@ -51,9 +51,6 @@ enum SshCommand {
 pub struct SshPty {
     alive: Arc<AtomicBool>,
     command_tx: tokio_mpsc::Sender<SshCommand>,
-    /// Runtime handle for async operations
-    #[allow(dead_code)]
-    runtime: Arc<tokio::runtime::Runtime>,
     /// SFTP client (created during session setup, cached here)
     sftp: Arc<tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<SftpClient>>>>>,
 }
@@ -140,8 +137,8 @@ impl Handler for Client {
 }
 
 impl SshPty {
-    /// Create a new SSH PTY connection
-    pub fn new(
+    /// Create a new SSH PTY connection (async version for use within tokio runtime)
+    pub async fn new_async(
         config: &SshConnectionConfig,
         cols: u16,
         rows: u16,
@@ -149,19 +146,14 @@ impl SshPty {
     ) -> Result<Self, SshError> {
         info!("Connecting to SSH server {}:{}", config.host, config.port);
 
-        // Create a dedicated runtime for this SSH session
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("ssh-backend")
-            .build()
-            .map_err(|e| SshError::Protocol(format!("Failed to create runtime: {}", e)))?;
-
-        let rt = Arc::new(rt);
-
-        // Connect and set up PTY
-        let (session, channel) = rt.block_on(async {
-            connect_and_setup_pty(config, cols, rows).await
-        })?;
+        // Connect and set up PTY with timeout
+        let (session, channel) = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            connect_and_setup_pty(config, cols, rows)
+        ).await {
+            Ok(result) => result?,
+            Err(_) => return Err(SshError::Protocol("Connection timeout (30s)".to_string())),
+        };
 
         let alive = Arc::new(AtomicBool::new(true));
         let (command_tx, command_rx) = tokio_mpsc::channel::<SshCommand>(64);
@@ -172,7 +164,7 @@ impl SshPty {
         // Spawn the actor task that owns the channel
         let alive_clone = alive.clone();
         let sftp_clone = sftp.clone();
-        rt.spawn(async move {
+        tokio::spawn(async move {
             // Create SFTP client
             match SftpClient::new(&session).await {
                 Ok(sftp_client) => {
@@ -189,7 +181,6 @@ impl SshPty {
         Ok(Self {
             alive,
             command_tx,
-            runtime: rt,
             sftp,
         })
     }

@@ -25,6 +25,20 @@ pub fn default_shell() -> String {
     }
 }
 
+/// Get the shell arguments for starting a new shell session
+pub fn shell_args() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        // Use -NoLogo to suppress the copyright banner
+        vec!["-NoLogo".to_string()]
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        vec![]
+    }
+}
+
 /// Get common SSH key paths to search
 pub fn ssh_key_search_paths() -> Vec<PathBuf> {
     let ssh_dir = dirs::home_dir()
@@ -69,6 +83,18 @@ pub fn pty_environment() -> Vec<(String, String)> {
         ("TERM".into(), "xterm-256color".into()),
         ("COLORTERM".into(), "truecolor".into()),
     ];
+
+    #[cfg(target_os = "windows")]
+    {
+        // Set UTF-8 code page for Windows console
+        env.push(("CHCP".into(), "65001".into()));
+        // Enable UTF-8 output for PowerShell
+        env.push(("PSOutputEncoding".into(), "UTF-8".into()));
+        // Python UTF-8 mode
+        env.push(("PYTHONIOENCODING".into(), "utf-8".into()));
+        // Node.js UTF-8
+        env.push(("NODE_OPTIONS".into(), "--no-warnings".into()));
+    }
 
     #[cfg(not(target_os = "windows"))]
     {
