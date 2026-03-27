@@ -569,4 +569,97 @@ mod tests {
             current_dir: "/home/user".to_string(),
         }
     }
+
+    #[tokio::test]
+    async fn test_list_dir_success() {
+        let mut mock = MockSftpSessionOps::new();
+        // resolve_path(".") appends "." to current_dir: "/home/user" + "/" + "." = "/home/user/."
+        // Mock returns entries sorted (directories first) as RealSftpSession::read_dir does
+        mock.expect_read_dir()
+            .with(mockall::predicate::eq("/home/user/."))
+            .returning(|_| Box::pin(async move {
+                Ok(vec![
+                    FileEntry { name: "folder".into(), path: "/home/user/folder".into(), is_dir: true, size: 0, modified: None },
+                    FileEntry { name: "file.txt".into(), path: "/home/user/file.txt".into(), is_dir: false, size: 100, modified: None },
+                ])
+            }));
+        let mut client = create_test_client(mock);
+        let result = client.list_dir(".").await.unwrap();
+        assert_eq!(result.len(), 2);
+        assert!(result[0].is_dir); // directories sorted first
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_empty() {
+        let mut mock = MockSftpSessionOps::new();
+        mock.expect_read_dir()
+            .with(mockall::predicate::eq("/home/user/."))
+            .returning(|_| Box::pin(async move { Ok(vec![]) }));
+        let mut client = create_test_client(mock);
+        let result = client.list_dir(".").await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_error() {
+        let mut mock = MockSftpSessionOps::new();
+        mock.expect_read_dir()
+            .with(mockall::predicate::eq("/home/user/."))
+            .returning(|_| Box::pin(async move { Err(SftpError::PermissionDenied { path: "/home/user/.".to_string() }) }));
+        let mut client = create_test_client(mock);
+        let result = client.list_dir(".").await;
+        assert!(matches!(result, Err(SftpError::PermissionDenied { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_mkdir_success() {
+        let mut mock = MockSftpSessionOps::new();
+        mock.expect_create_dir()
+            .with(mockall::predicate::eq("/home/user/newdir"))
+            .returning(|_| Box::pin(async move { Ok(()) }));
+        let mut client = create_test_client(mock);
+        let result = client.mkdir("newdir").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_mkdir_error() {
+        let mut mock = MockSftpSessionOps::new();
+        mock.expect_create_dir()
+            .with(mockall::predicate::eq("/home/user/no-permission"))
+            .returning(|_| Box::pin(async move { Err(SftpError::PermissionDenied { path: "/home/user/no-permission".to_string() }) }));
+        let mut client = create_test_client(mock);
+        let result = client.mkdir("no-permission").await;
+        assert!(matches!(result, Err(SftpError::PermissionDenied { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_delete_file() {
+        let mut mock = MockSftpSessionOps::new();
+        // delete() first calls metadata to check if it's a file or directory
+        mock.expect_metadata()
+            .with(mockall::predicate::eq("/home/user/testfile.txt"))
+            .returning(|_| Box::pin(async move { Ok(FileMetadata { is_dir: false, size: 100, modified: None }) }));
+        mock.expect_remove_file()
+            .with(mockall::predicate::eq("/home/user/testfile.txt"))
+            .returning(|_| Box::pin(async move { Ok(()) }));
+        let mut client = create_test_client(mock);
+        let result = client.delete("testfile.txt").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_delete_directory() {
+        let mut mock = MockSftpSessionOps::new();
+        // delete() first calls metadata to check if it's a file or directory
+        mock.expect_metadata()
+            .with(mockall::predicate::eq("/home/user/testdir"))
+            .returning(|_| Box::pin(async move { Ok(FileMetadata { is_dir: true, size: 0, modified: None }) }));
+        mock.expect_remove_dir()
+            .with(mockall::predicate::eq("/home/user/testdir"))
+            .returning(|_| Box::pin(async move { Ok(()) }));
+        let mut client = create_test_client(mock);
+        let result = client.delete("testdir").await;
+        assert!(result.is_ok());
+    }
 }
