@@ -11,6 +11,40 @@ use tracing::{error, info, warn};
 
 use crate::error::SftpError;
 
+/// Trait abstracting SFTP session operations for testing
+#[async_trait::async_trait]
+pub trait SftpSessionOps: Send + Sync + std::fmt::Debug {
+    async fn read_dir(&self, path: &str) -> Result<Vec<FileEntry>, SftpError>;
+    async fn open(&self, path: &str) -> Result<Box<dyn SftpFileReadOps>, SftpError>;
+    async fn create(&self, path: &str) -> Result<Box<dyn SftpFileWriteOps>, SftpError>;
+    async fn create_dir(&self, path: &str) -> Result<(), SftpError>;
+    async fn remove_dir(&self, path: &str) -> Result<(), SftpError>;
+    async fn remove_file(&self, path: &str) -> Result<(), SftpError>;
+    async fn canonicalize(&self, path: &str) -> Result<String, SftpError>;
+    async fn is_dir(&self, path: &str) -> Result<bool, SftpError>;
+    async fn metadata(&self, path: &str) -> Result<FileMetadata, SftpError>;
+    async fn rename(&self, from: &str, to: &str) -> Result<(), SftpError>;
+}
+
+#[async_trait::async_trait]
+pub trait SftpFileReadOps: Send + Sync {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, SftpError>;
+    async fn close(&mut self) -> Result<(), SftpError>;
+}
+
+#[async_trait::async_trait]
+pub trait SftpFileWriteOps: Send + Sync {
+    async fn write_all(&mut self, buf: &[u8]) -> Result<(), SftpError>;
+    async fn close(&mut self) -> Result<(), SftpError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct FileMetadata {
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: Option<std::time::SystemTime>,
+}
+
 /// SFTP client for file transfers over SSH
 pub struct SftpClient {
     session: SftpSession,
