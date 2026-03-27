@@ -13,7 +13,7 @@ use crate::error::SftpError;
 
 /// Trait abstracting SFTP session operations for testing
 #[async_trait::async_trait]
-#[mockall::automock]
+#[cfg_attr(test, mockall::automock)]
 pub trait SftpSessionOps: Send + Sync + std::fmt::Debug {
     async fn read_dir(&self, path: &str) -> Result<Vec<FileEntry>, SftpError>;
     async fn open(&self, path: &str) -> Result<Box<dyn SftpFileReadOps>, SftpError>;
@@ -28,14 +28,14 @@ pub trait SftpSessionOps: Send + Sync + std::fmt::Debug {
 }
 
 #[async_trait::async_trait]
-#[mockall::automock]
+#[cfg_attr(test, mockall::automock)]
 pub trait SftpFileReadOps: Send + Sync {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, SftpError>;
     async fn close(&mut self) -> Result<(), SftpError>;
 }
 
 #[async_trait::async_trait]
-#[mockall::automock]
+#[cfg_attr(test, mockall::automock)]
 pub trait SftpFileWriteOps: Send + Sync {
     async fn write_all(&mut self, buf: &[u8]) -> Result<(), SftpError>;
     async fn close(&mut self) -> Result<(), SftpError>;
