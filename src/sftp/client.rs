@@ -38,6 +38,181 @@ pub trait SftpFileWriteOps: Send + Sync {
     async fn close(&mut self) -> Result<(), SftpError>;
 }
 
+// ============================================================================
+// Real SFTP session implementation wrapping russh_sftp
+// ============================================================================
+
+/// Wrapper around russh_sftp::client::SftpSession implementing SftpSessionOps
+pub struct RealSftpSession {
+    inner: SftpSession,
+}
+
+impl std::fmt::Debug for RealSftpSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RealSftpSession")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RealSftpSession {
+    pub fn new(session: SftpSession) -> Self {
+        Self { inner: session }
+    }
+}
+
+/// Wrapper around russh_sftp file handle for reading
+pub struct RealSftpFileReader {
+    inner: russh_sftp::client::fs::File,
+}
+
+/// Wrapper around russh_sftp file handle for writing
+pub struct RealSftpFileWriter {
+    inner: russh_sftp::client::fs::File,
+}
+
+#[async_trait::async_trait]
+impl SftpSessionOps for RealSftpSession {
+    async fn read_dir(&self, path: &str) -> Result<Vec<FileEntry>, SftpError> {
+        let entries = self.inner.read_dir(path).await.map_err(|e| {
+            SftpError::Protocol(format!("Failed to list directory: {}", e))
+        })?;
+
+        let mut file_entries = Vec::new();
+        for entry in entries {
+            let file_name = entry.file_name().to_string();
+            let metadata = entry.metadata();
+
+            let is_dir = metadata.is_dir();
+            let size = metadata.len();
+            let modified = metadata.modified().ok();
+
+            let full_path = if path.ends_with('/') {
+                format!("{}{}", path, file_name)
+            } else {
+                format!("{}/{}", path, file_name)
+            };
+
+            file_entries.push(FileEntry {
+                name: file_name,
+                path: full_path,
+                is_dir,
+                size,
+                modified,
+            });
+        }
+
+        // Sort entries: directories first, then by name
+        file_entries.sort_by(|a, b| {
+            if a.is_dir != b.is_dir {
+                b.is_dir.cmp(&a.is_dir)
+            } else {
+                a.name.to_lowercase().cmp(&b.name.to_lowercase())
+            }
+        });
+
+        Ok(file_entries)
+    }
+
+    async fn open(&self, path: &str) -> Result<Box<dyn SftpFileReadOps>, SftpError> {
+        let file = self.inner.open(path).await.map_err(|e| {
+            SftpError::FileNotFound { path: path.to_string() }
+        })?;
+        Ok(Box::new(RealSftpFileReader { inner: file }))
+    }
+
+    async fn create(&self, path: &str) -> Result<Box<dyn SftpFileWriteOps>, SftpError> {
+        use russh_sftp::protocol::OpenFlags;
+        let file = self.inner
+            .open_with_flags(path, OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE)
+            .await
+            .map_err(|e| {
+                SftpError::Protocol(format!("Failed to create file: {}", e))
+            })?;
+        Ok(Box::new(RealSftpFileWriter { inner: file }))
+    }
+
+    async fn create_dir(&self, path: &str) -> Result<(), SftpError> {
+        self.inner.create_dir(path).await.map_err(|e| {
+            SftpError::Protocol(format!("Failed to create directory: {}", e))
+        })
+    }
+
+    async fn remove_dir(&self, path: &str) -> Result<(), SftpError> {
+        self.inner.remove_dir(path).await.map_err(|e| {
+            SftpError::Protocol(format!("Failed to remove directory: {}", e))
+        })
+    }
+
+    async fn remove_file(&self, path: &str) -> Result<(), SftpError> {
+        self.inner.remove_file(path).await.map_err(|e| {
+            SftpError::Protocol(format!("Failed to remove file: {}", e))
+        })
+    }
+
+    async fn canonicalize(&self, path: &str) -> Result<String, SftpError> {
+        self.inner.canonicalize(path).await.map_err(|e| {
+            SftpError::Protocol(format!("Failed to canonicalize path: {}", e))
+        })
+    }
+
+    async fn is_dir(&self, path: &str) -> Result<bool, SftpError> {
+        let metadata = self.inner.metadata(path).await.map_err(|_e| {
+            SftpError::FileNotFound { path: path.to_string() }
+        })?;
+        Ok(metadata.is_dir())
+    }
+
+    async fn metadata(&self, path: &str) -> Result<FileMetadata, SftpError> {
+        let metadata = self.inner.metadata(path).await.map_err(|e| {
+            SftpError::Protocol(format!("Failed to read metadata: {}", e))
+        })?;
+        Ok(FileMetadata {
+            is_dir: metadata.is_dir(),
+            size: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<(), SftpError> {
+        self.inner.rename(from, to).await.map_err(|e| {
+            SftpError::Protocol(format!("Failed to rename: {}", e))
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl SftpFileReadOps for RealSftpFileReader {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, SftpError> {
+        self.inner.read(buf).await.map_err(|e| {
+            SftpError::TransferInterrupted { reason: e.to_string() }
+        })
+    }
+
+    async fn close(&mut self) -> Result<(), SftpError> {
+        self.inner.shutdown().await.map_err(|e| {
+            SftpError::Protocol(format!("Failed to close file: {}", e))
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl SftpFileWriteOps for RealSftpFileWriter {
+    async fn write_all(&mut self, buf: &[u8]) -> Result<(), SftpError> {
+        self.inner.write_all(buf).await.map_err(|e| {
+            SftpError::TransferInterrupted { reason: e.to_string() }
+        })
+    }
+
+    async fn close(&mut self) -> Result<(), SftpError> {
+        self.inner.flush().await.map_err(|e| {
+            SftpError::Protocol(format!("Failed to flush file: {}", e))
+        })?;
+        self.inner.shutdown().await.map_err(|e| {
+            SftpError::Protocol(format!("Failed to close file: {}", e))
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FileMetadata {
     pub is_dir: bool,
