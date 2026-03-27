@@ -37,11 +37,11 @@ pub async fn backend_loop(
                 match cmd {
                     AppCommand::CreateSession { session_id, config, respond_to } => {
                         let result = create_local_session(&mut sessions, &event_tx, session_id, config).await;
-                        let _ = respond_to.send(result.map(|id| id).map_err(|e| e.to_string())).await;
+                        let _ = respond_to.send(result.map_err(|e| e.to_string())).await;
                     }
                     AppCommand::CreateSshSession { session_id, ssh_config, respond_to } => {
                         let result = create_ssh_session(&mut sessions, &event_tx, session_id, ssh_config).await;
-                        let _ = respond_to.send(result.map(|id| id).map_err(|e| e.to_string())).await;
+                        let _ = respond_to.send(result.map_err(|e| e.to_string())).await;
                     }
                     AppCommand::WriteInput { session_id, data } => {
                         if let Some(session) = sessions.get(&session_id) {

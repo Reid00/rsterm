@@ -33,6 +33,7 @@ pub enum TabKind {
     Local { shell: String },
 }
 
+#[derive(Clone)]
 pub struct Tab {
     pub id: TabId,
     pub title: String,
@@ -45,7 +46,7 @@ pub struct Tab {
 }
 
 /// SFTP panel state for file browsing UI
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SftpPanelState {
     pub visible: bool,
     pub current_path: String,
@@ -53,19 +54,6 @@ pub struct SftpPanelState {
     pub selected: Option<usize>,
     pub loading: bool,
     pub error: Option<String>,
-}
-
-impl Default for SftpPanelState {
-    fn default() -> Self {
-        Self {
-            visible: false,
-            current_path: String::new(),
-            entries: Vec::new(),
-            selected: None,
-            loading: false,
-            error: None,
-        }
-    }
 }
 
 /// File entry for display in the SFTP panel
@@ -144,6 +132,14 @@ pub enum ModalDialog {
     Error {
         title: String,
         message: String,
+    },
+    SftpNewFolder {
+        folder_name: String,
+        current_path: String,
+    },
+    SftpDeleteConfirm {
+        item_name: String,
+        item_path: String,
     },
 }
 

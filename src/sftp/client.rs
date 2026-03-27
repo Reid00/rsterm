@@ -117,7 +117,7 @@ impl SftpSessionOps for RealSftpSession {
     }
 
     async fn open(&self, path: &str) -> Result<Box<dyn SftpFileReadOps>, SftpError> {
-        let file = self.inner.open(path).await.map_err(|e| {
+        let file = self.inner.open(path).await.map_err(|_| {
             SftpError::FileNotFound { path: path.to_string() }
         })?;
         Ok(Box::new(RealSftpFileReader { inner: file }))
@@ -336,7 +336,7 @@ impl SftpClient {
         if let Some(parent) = local_path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
-                .map_err(|e| SftpError::Io(e))?;
+                .map_err(SftpError::Io)?;
         }
 
         // Create local file for writing
@@ -368,7 +368,7 @@ impl SftpClient {
             total_bytes += bytes_read as u64;
         }
 
-        local_file.flush().await.map_err(|e| SftpError::Io(e))?;
+        local_file.flush().await.map_err(SftpError::Io)?;
 
         info!("Download complete: {} bytes transferred", total_bytes);
 
@@ -396,7 +396,7 @@ impl SftpClient {
             })?;
 
         // Get local file size
-        let local_metadata = local_file.metadata().await.map_err(|e| SftpError::Io(e))?;
+        let local_metadata = local_file.metadata().await.map_err(SftpError::Io)?;
         let file_size = local_metadata.len();
 
         // Open remote file for writing
