@@ -662,4 +662,105 @@ mod tests {
         let result = client.delete("testdir").await;
         assert!(result.is_ok());
     }
+
+    #[tokio::test]
+    async fn test_upload_success() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_file = temp_dir.path().join("test.txt");
+        tokio::fs::write(&temp_file, b"test content").await.unwrap();
+
+        let mut mock = MockSftpSessionOps::new();
+        mock.expect_create()
+            .with(mockall::predicate::eq("/home/user/test.txt"))
+            .returning(|_| {
+                let mut file_mock = MockSftpFileWriteOps::new();
+                file_mock.expect_write_all()
+                    .returning(|_| Box::pin(async move { Ok(()) }));
+                file_mock.expect_close()
+                    .returning(|| Box::pin(async move { Ok(()) }));
+                Box::pin(async move { Ok(Box::new(file_mock) as Box<dyn SftpFileWriteOps>) })
+            });
+
+        let mut client = create_test_client(mock);
+        let result = client.upload(temp_file.to_str().unwrap(), "test.txt").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_upload_file_not_found() {
+        let mock = MockSftpSessionOps::new();
+        // No expectations needed - upload fails before calling session methods
+
+        let mut client = create_test_client(mock);
+        let result = client.upload("/nonexistent/file.txt", "remote.txt").await;
+        assert!(matches!(result, Err(SftpError::FileNotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_download_success() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let local_path = temp_dir.path().join("downloaded.txt");
+
+        let mut mock = MockSftpSessionOps::new();
+        mock.expect_open()
+            .with(mockall::predicate::eq("/home/user/remote.txt"))
+            .returning(|_| {
+                let mut file_mock = MockSftpFileReadOps::new();
+                // First read returns some data
+                file_mock.expect_read()
+                    .times(1)
+                    .returning(|buf| {
+                        let data = b"test data";
+                        buf[..data.len()].copy_from_slice(data);
+                        Box::pin(async move { Ok(data.len()) })
+                    });
+                // Second read returns 0 (EOF)
+                file_mock.expect_read()
+                    .times(1)
+                    .returning(|_| Box::pin(async move { Ok(0) }));
+                file_mock.expect_close()
+                    .returning(|| Box::pin(async move { Ok(()) }));
+                Box::pin(async move { Ok(Box::new(file_mock) as Box<dyn SftpFileReadOps>) })
+            });
+
+        let mut client = create_test_client(mock);
+        let result = client.download("remote.txt", local_path.to_str().unwrap()).await;
+        assert!(result.is_ok());
+
+        // Verify the downloaded content
+        let content = tokio::fs::read_to_string(&local_path).await.unwrap();
+        assert_eq!(content, "test data");
+    }
+
+    #[tokio::test]
+    async fn test_cd_success() {
+        let mut mock = MockSftpSessionOps::new();
+        mock.expect_canonicalize()
+            .with(mockall::predicate::eq("/home/user/subdir"))
+            .returning(|_| Box::pin(async move { Ok("/home/user/subdir".to_string()) }));
+        mock.expect_metadata()
+            .with(mockall::predicate::eq("/home/user/subdir"))
+            .returning(|_| Box::pin(async move { Ok(FileMetadata { is_dir: true, size: 0, modified: None }) }));
+
+        let mut client = create_test_client(mock);
+        let result = client.cd("subdir").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "/home/user/subdir");
+        assert_eq!(client.pwd(), "/home/user/subdir");
+    }
+
+    #[tokio::test]
+    async fn test_cd_not_directory() {
+        let mut mock = MockSftpSessionOps::new();
+        mock.expect_canonicalize()
+            .with(mockall::predicate::eq("/home/user/notadir"))
+            .returning(|_| Box::pin(async move { Ok("/home/user/notadir".to_string()) }));
+        mock.expect_metadata()
+            .with(mockall::predicate::eq("/home/user/notadir"))
+            .returning(|_| Box::pin(async move { Ok(FileMetadata { is_dir: false, size: 100, modified: None }) }));
+
+        let mut client = create_test_client(mock);
+        let result = client.cd("notadir").await;
+        assert!(matches!(result, Err(SftpError::Protocol(_))));
+    }
 }
