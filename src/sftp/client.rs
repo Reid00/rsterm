@@ -222,7 +222,7 @@ pub struct FileMetadata {
 
 /// SFTP client for file transfers over SSH
 pub struct SftpClient {
-    session: SftpSession,
+    session: Box<dyn SftpSessionOps>,
     current_dir: String,
 }
 
@@ -297,9 +297,17 @@ impl SftpClient {
         info!("SFTP session established, cwd: {:?}", cwd);
 
         Ok(Self {
-            session: sftp,
+            session: Box::new(RealSftpSession::new(sftp)),
             current_dir: cwd,
         })
+    }
+
+    /// Create an SFTP client with a custom session (for testing)
+    pub fn with_session(session: Box<dyn SftpSessionOps>, cwd: String) -> Self {
+        Self {
+            session,
+            current_dir: cwd,
+        }
     }
 
     /// List directory contents
@@ -308,51 +316,7 @@ impl SftpClient {
 
         info!("Listing directory: {}", resolved_path);
 
-        let entries = self
-            .session
-            .read_dir(&resolved_path)
-            .await
-            .map_err(|e| {
-                error!("Failed to list directory {}: {}", resolved_path, e);
-                SftpError::Protocol(format!("Failed to list directory: {}", e))
-            })?;
-
-        let mut file_entries = Vec::new();
-        for entry in entries {
-            // russh-sftp DirEntry has file_name() returning &str
-            let file_name = entry.file_name().to_string();
-            let metadata = entry.metadata();
-
-            let is_dir = metadata.is_dir();
-            let size = metadata.len();
-            let modified = metadata.modified().ok();
-
-            // Build full path
-            let full_path = if resolved_path.ends_with('/') {
-                format!("{}{}", resolved_path, file_name)
-            } else {
-                format!("{}/{}", resolved_path, file_name)
-            };
-
-            file_entries.push(FileEntry {
-                name: file_name,
-                path: full_path,
-                is_dir,
-                size,
-                modified,
-            });
-        }
-
-        // Sort entries: directories first, then by name
-        file_entries.sort_by(|a, b| {
-            if a.is_dir != b.is_dir {
-                b.is_dir.cmp(&a.is_dir)
-            } else {
-                a.name.to_lowercase().cmp(&b.name.to_lowercase())
-            }
-        });
-
-        Ok(file_entries)
+        self.session.read_dir(&resolved_path).await
     }
 
     /// Download a file from remote to local
@@ -363,16 +327,7 @@ impl SftpClient {
         info!("Downloading {} to {}", remote_path, local);
 
         // Open remote file for reading
-        let mut remote_file = self
-            .session
-            .open(&remote_path)
-            .await
-            .map_err(|e| {
-                error!("Failed to open remote file {}: {}", remote_path, e);
-                SftpError::FileNotFound {
-                    path: remote_path.clone(),
-                }
-            })?;
+        let mut remote_file = self.session.open(&remote_path).await?;
 
         // Create parent directories if needed
         if let Some(parent) = local_path.parent() {
@@ -394,12 +349,7 @@ impl SftpClient {
         let mut total_bytes = 0u64;
 
         loop {
-            let bytes_read = remote_file
-                .read(&mut buffer)
-                .await
-                .map_err(|e| SftpError::TransferInterrupted {
-                    reason: e.to_string(),
-                })?;
+            let bytes_read = remote_file.read(&mut buffer).await?;
 
             if bytes_read == 0 {
                 break;
@@ -420,7 +370,7 @@ impl SftpClient {
         info!("Download complete: {} bytes transferred", total_bytes);
 
         // Close remote file properly
-        remote_file.shutdown().await.ok();
+        remote_file.close().await.ok();
 
         Ok(())
     }
@@ -447,18 +397,7 @@ impl SftpClient {
         let file_size = local_metadata.len();
 
         // Open remote file for writing
-        use russh_sftp::protocol::OpenFlags;
-        let mut remote_file = self
-            .session
-            .open_with_flags(
-                &remote_path,
-                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
-            )
-            .await
-            .map_err(|e| {
-                error!("Failed to create remote file {}: {}", remote_path, e);
-                SftpError::Protocol(format!("Failed to create remote file: {}", e))
-            })?;
+        let mut remote_file = self.session.create(&remote_path).await?;
 
         // Copy data from local to remote
         let mut buffer = vec![0u8; 64 * 1024]; // 64KB buffer
@@ -476,25 +415,17 @@ impl SftpClient {
                 break;
             }
 
-            remote_file
-                .write_all(&buffer[..bytes_read])
-                .await
-                .map_err(|e| SftpError::TransferInterrupted {
-                    reason: e.to_string(),
-                })?;
+            remote_file.write_all(&buffer[..bytes_read]).await?;
 
             total_bytes += bytes_read as u64;
         }
 
-        remote_file.flush().await.map_err(|e| SftpError::Protocol(e.to_string()))?;
+        remote_file.close().await?;
 
         info!(
             "Upload complete: {} bytes transferred of {} bytes",
             total_bytes, file_size
         );
-
-        // Close remote file properly
-        remote_file.shutdown().await.ok();
 
         Ok(())
     }
@@ -504,23 +435,17 @@ impl SftpClient {
         let resolved_path = self.resolve_path(path);
 
         // Verify the directory exists and get canonical path
-        let canonical = self
-            .session
-            .canonicalize(&resolved_path)
-            .await
-            .map_err(|_e| {
-                warn!("Directory not found: {}", resolved_path);
-                SftpError::FileNotFound {
-                    path: resolved_path.clone(),
-                }
-            })?;
-
-        // Check if it's a directory
-        let metadata = self.session.metadata(&canonical).await.map_err(|e| {
-            SftpError::Protocol(format!("Failed to read metadata: {}", e))
+        let canonical = self.session.canonicalize(&resolved_path).await.map_err(|_e| {
+            warn!("Directory not found: {}", resolved_path);
+            SftpError::FileNotFound {
+                path: resolved_path.clone(),
+            }
         })?;
 
-        if !metadata.is_dir() {
+        // Check if it's a directory
+        let metadata = self.session.metadata(&canonical).await?;
+
+        if !metadata.is_dir {
             return Err(SftpError::Protocol(format!(
                 "Not a directory: {}",
                 canonical
@@ -540,13 +465,7 @@ impl SftpClient {
 
         info!("Creating directory: {}", resolved_path);
 
-        self.session
-            .create_dir(&resolved_path)
-            .await
-            .map_err(|e| {
-                error!("Failed to create directory {}: {}", resolved_path, e);
-                SftpError::Protocol(format!("Failed to create directory: {}", e))
-            })?;
+        self.session.create_dir(&resolved_path).await?;
 
         info!("Directory created: {}", resolved_path);
 
@@ -560,30 +479,14 @@ impl SftpClient {
         info!("Deleting: {}", resolved_path);
 
         // Check if it's a file or directory
-        let metadata = self
-            .session
-            .metadata(&resolved_path)
-            .await
-            .map_err(|_e| SftpError::FileNotFound {
-                path: resolved_path.clone(),
-            })?;
+        let metadata = self.session.metadata(&resolved_path).await.map_err(|_e| SftpError::FileNotFound {
+            path: resolved_path.clone(),
+        })?;
 
-        if metadata.is_dir() {
-            self.session
-                .remove_dir(&resolved_path)
-                .await
-                .map_err(|e| {
-                    error!("Failed to remove directory {}: {}", resolved_path, e);
-                    SftpError::Protocol(format!("Failed to remove directory: {}", e))
-                })?;
+        if metadata.is_dir {
+            self.session.remove_dir(&resolved_path).await?;
         } else {
-            self.session
-                .remove_file(&resolved_path)
-                .await
-                .map_err(|e| {
-                    error!("Failed to remove file {}: {}", resolved_path, e);
-                    SftpError::Protocol(format!("Failed to remove file: {}", e))
-                })?;
+            self.session.remove_file(&resolved_path).await?;
         }
 
         info!("Deleted: {}", resolved_path);
@@ -608,11 +511,6 @@ impl SftpClient {
         }
     }
 
-    /// Get the underlying SFTP session (for advanced operations)
-    pub fn session(&self) -> &SftpSession {
-        &self.session
-    }
-
     /// Rename a file or directory
     pub async fn rename(&mut self, from: &str, to: &str) -> Result<(), SftpError> {
         let from_path = self.resolve_path(from);
@@ -620,13 +518,7 @@ impl SftpClient {
 
         info!("Renaming {} to {}", from_path, to_path);
 
-        self.session
-            .rename(&from_path, &to_path)
-            .await
-            .map_err(|e| {
-                error!("Failed to rename {} to {}: {}", from_path, to_path, e);
-                SftpError::Protocol(format!("Failed to rename: {}", e))
-            })?;
+        self.session.rename(&from_path, &to_path).await?;
 
         Ok(())
     }
@@ -641,17 +533,11 @@ impl SftpClient {
     pub async fn metadata(&mut self, path: &str) -> Result<FileEntry, SftpError> {
         let resolved_path = self.resolve_path(path);
 
-        let canonical = self
-            .session
-            .canonicalize(&resolved_path)
-            .await
-            .map_err(|_e| SftpError::FileNotFound {
-                path: resolved_path.clone(),
-            })?;
-
-        let metadata = self.session.metadata(&canonical).await.map_err(|e| {
-            SftpError::Protocol(format!("Failed to read metadata: {}", e))
+        let canonical = self.session.canonicalize(&resolved_path).await.map_err(|_e| SftpError::FileNotFound {
+            path: resolved_path.clone(),
         })?;
+
+        let metadata = self.session.metadata(&canonical).await?;
 
         // Extract name from path
         let name = canonical
@@ -663,9 +549,9 @@ impl SftpClient {
         Ok(FileEntry {
             name,
             path: canonical,
-            is_dir: metadata.is_dir(),
-            size: metadata.len(),
-            modified: metadata.modified().ok(),
+            is_dir: metadata.is_dir,
+            size: metadata.size,
+            modified: metadata.modified,
         })
     }
 }
