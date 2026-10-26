@@ -1,0 +1,266 @@
+name: Build binaries
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  RUST_TOOLCHAIN: "1.99.1"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  MACOSX_DEPLOYMENT_TARGET: "15.0"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  metadata:
+    name: Validate version and toolchain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate package version and release tag
+        id: version
+        env:
+          BUILD_REF: ${{ github.ref }}
+          BUILD_REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import sys
+          import tomllib
+          sys.path.insert(0, "scripts")
+          from package import validate_version
+          manifest = tomllib.loads(Path("Cargo.toml").read_text(encoding="utf-8"))
+          version = validate_version(manifest["package"]["version"])
+          toolchain = tomllib.loads(Path("rust-toolchain.toml").read_text(encoding="utf-8"))
+          if toolchain["toolchain"]["channel"] != os.environ["RUST_TOOLCHAIN"]:
+              raise SystemExit("Workflow and rust-toolchain.toml versions differ")
+          if os.environ["BUILD_REF"].startswith("refs/tags/"):
+              if os.environ["BUILD_REF_NAME"] != "v" + version:
+                  raise SystemExit("Release tag must equal v + Cargo.toml package version")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("version=" + version + "\n")
+          PY
+
+  quality:
+    name: macOS quality checks
+    needs: metadata
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: quality-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check all targets
+        run: cargo check --all-targets --locked
+      - name: Run tests
+        run: cargo test --locked
+      - name: Deny Clippy warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test release packaging
+        run: python -m unittest discover -s scripts -p 'test_*.py' -v
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: metadata
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            binary: rsterm
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: rsterm
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            binary: rsterm.exe
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: rsterm
+    runs-on: ${{ matrix.os }}
+    env:
+      RUST_TARGET: ${{ matrix.target }}
+      PACKAGE_VERSION: ${{ needs.metadata.outputs.version }}
+      BINARY_NAME: ${{ matrix.binary }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential clang cmake pkg-config \
+            libfontconfig1-dev libfreetype6-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-composite0-dev \
+            libxcb-randr0-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxcb-xinput-dev libxcb-xkb-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libdbus-1-dev libegl1-mesa-dev libvulkan-dev
+      - name: Locate Windows shader compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $sdk = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+          $fxc = Get-ChildItem -Path $sdk -Directory |
+            Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+            Sort-Object { [version]$_.Name } -Descending |
+            ForEach-Object { Join-Path $_.FullName 'x64\fxc.exe' } |
+            Where-Object { Test-Path -LiteralPath $_ } |
+            Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe was not found' }
+          "GPUI_FXC_PATH=$fxc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Using shader compiler: $fxc"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: release-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+      - name: Compile all Windows and Linux targets
+        if: runner.os != 'macOS'
+        shell: bash
+        run: cargo check --all-targets --locked --target "$RUST_TARGET"
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --locked --target "$RUST_TARGET"
+      - name: Package release binary
+        shell: bash
+        run: |
+          python scripts/package.py \
+            --target "$RUST_TARGET" \
+            --version "$PACKAGE_VERSION" \
+            --binary "target/$RUST_TARGET/release/$BINARY_NAME" \
+            --output-dir dist
+      - name: Upload binary and checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsterm-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  draft-release:
+    name: Create draft release
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    needs: [metadata, quality, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      PACKAGE_VERSION: ${{ needs.metadata.outputs.version }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rsterm-*
+          path: packages
+          merge-multiple: true
+      - name: Validate all four archives and checksums
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          version = os.environ["PACKAGE_VERSION"]
+          if os.environ["RELEASE_TAG"] != "v" + version:
+              raise SystemExit("Release tag does not match package version")
+          suffixes = {
+              "aarch64-apple-darwin": ".app.zip",
+              "x86_64-apple-darwin": ".app.zip",
+              "x86_64-pc-windows-msvc": ".zip",
+              "x86_64-unknown-linux-gnu": ".tar.gz",
+          }
+          names = ["rsterm-" + version + "-" + target + suffix
+                   for target, suffix in suffixes.items()]
+          root = Path("packages")
+          expected = set(names + [name + ".sha256" for name in names])
+          if {path.name for path in root.iterdir()} != expected:
+              raise SystemExit("Expected exactly four archives and four checksums")
+          for name in names:
+              archive = root / name
+              checksum = root / (name + ".sha256")
+              if any(path.is_symlink() or not path.is_file() for path in (archive, checksum)):
+                  raise SystemExit("Release assets must be regular files")
+              digest = hashlib.sha256()
+              with archive.open("rb") as source:
+                  for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              if checksum.read_text(encoding="ascii") != digest.hexdigest() + "  " + name + "\n":
+                  raise SystemExit("Checksum mismatch: " + name)
+          PY
+      - name: Create draft without replacing an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            printf '%s\n' 'A release already exists for this tag; refusing to replace it.' >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" packages/* \
+            --draft --verify-tag --title "RSTerm $PACKAGE_VERSION" \
+            --notes "Native desktop binaries and SHA-256 checksums. macOS apps are ad-hoc signed, not Developer ID signed or notarized. Linux binaries require a compatible GNU desktop runtime. Review and test all platform downloads before publishing."

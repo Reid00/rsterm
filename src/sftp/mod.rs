@@ -6,4 +6,10 @@
 
 mod client;
 
-pub use client::{FileEntry, SftpClient, SftpCommand};
+#[cfg(test)]
+pub(crate) use client::MockSftpSessionOps;
+
+pub use client::{
+    remote_parent, FileEntry, FileMetadata, SftpClient, SftpFileReadOps, SftpFileWriteOps,
+    SftpSessionOps,
+};

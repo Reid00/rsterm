@@ -2,8 +2,9 @@
 //! Tokio async backend for SSH, PTY, SFTP
 
 mod handle;
-mod pty;
+mod inspection;
 mod r#loop;
+mod pty;
 mod ssh;
 
 pub use handle::*;

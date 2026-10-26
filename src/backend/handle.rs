@@ -1,129 +1,186 @@
-// src/backend/handle.rs
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::time::SystemTime;
 
-use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::oneshot;
 
-use crate::backend::{PtyBackend, SshConnectionConfig};
+use crate::backend::SshConnectionConfig;
 use crate::config::SessionConfig;
-use crate::state::FileEntryInfo;
+use crate::inspection::{InspectionData, InspectionError, InspectionKind};
 
-/// Handle to a terminal session
-pub struct SessionHandle {
-    pub id: String,
-    pub config: SessionConfig,
-    pub backend: Arc<dyn PtyBackend>,
+pub type RequestId = u64;
+pub type TransferId = u64;
+
+#[derive(Clone, Debug)]
+pub struct FileEntryInfo {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub size: u64,
+    pub modified: Option<SystemTime>,
+    pub permissions: Option<u32>,
 }
 
-/// Commands from the UI to the backend
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransferOutcome {
+    Completed,
+    Cancelled,
+    Failed(String),
+}
+
 #[derive(Debug)]
 pub enum AppCommand {
-    /// Create a new local session
     CreateSession {
         session_id: String,
         config: SessionConfig,
-        respond_to: tokio_mpsc::Sender<Result<String, String>>,
     },
-    /// Create a new SSH session
     CreateSshSession {
         session_id: String,
         ssh_config: SshConnectionConfig,
-        respond_to: tokio_mpsc::Sender<Result<String, String>>,
     },
-    /// Write input to a session
     WriteInput {
         session_id: String,
         data: Vec<u8>,
     },
-    /// Resize a session
     ResizeSession {
         session_id: String,
         cols: u16,
         rows: u16,
     },
-    /// Close a session
     CloseSession {
         session_id: String,
     },
-    /// Initialize SFTP for an SSH session
     SftpInit {
         session_id: String,
     },
-    /// List directory contents via SFTP
     SftpListDir {
         session_id: String,
+        request_id: RequestId,
         path: String,
     },
-    /// Download a file via SFTP
-    SftpDownload {
-        session_id: String,
-        remote_path: String,
-        local_path: String,
-    },
-    /// Upload a file via SFTP
-    SftpUpload {
-        session_id: String,
-        local_path: String,
-        remote_path: String,
-    },
-    /// Create directory via SFTP
     SftpMkdir {
         session_id: String,
+        request_id: RequestId,
         path: String,
     },
-    /// Delete file or directory via SFTP
     SftpDelete {
         session_id: String,
+        request_id: RequestId,
         path: String,
     },
-    /// Shutdown the backend
+    SftpRename {
+        session_id: String,
+        request_id: RequestId,
+        from: String,
+        to: String,
+    },
+    SftpChmod {
+        session_id: String,
+        request_id: RequestId,
+        path: String,
+        mode: u32,
+    },
+    SftpUpload {
+        session_id: String,
+        transfer_id: TransferId,
+        local_path: PathBuf,
+        remote_path: String,
+        overwrite: bool,
+    },
+    SftpDownload {
+        session_id: String,
+        transfer_id: TransferId,
+        remote_path: String,
+        local_path: PathBuf,
+        overwrite: bool,
+    },
+    CancelTransfer {
+        session_id: String,
+        transfer_id: TransferId,
+    },
+    Inspect {
+        session_id: String,
+        request_id: RequestId,
+        kind: InspectionKind,
+    },
+    CancelInspection {
+        session_id: String,
+        request_id: RequestId,
+    },
     Shutdown,
 }
 
-/// Events from backend to UI
 #[derive(Debug)]
 pub enum BackendEvent {
-    /// Session output received
+    SessionCreated {
+        session_id: String,
+    },
     SessionOutput {
         session_id: String,
         data: Vec<u8>,
     },
-    /// Session closed (PTY died)
     SessionClosed {
         session_id: String,
+        reason: Option<String>,
+        retryable: bool,
     },
-    /// Session created
-    SessionCreated {
+    SessionFailed {
+        session_id: String,
+        error: String,
+        retryable: bool,
+    },
+    ShellReady {
         session_id: String,
     },
-    /// SFTP initialized for session
+    InspectionResult {
+        session_id: String,
+        request_id: RequestId,
+        result: Result<InspectionData, InspectionError>,
+    },
+    InspectionReady {
+        session_id: String,
+    },
+    ShellUnavailable {
+        session_id: String,
+        error: String,
+    },
+    HostKeyPrompt {
+        session_id: String,
+        host: String,
+        port: u16,
+        algorithm: String,
+        fingerprint: String,
+        respond_to: oneshot::Sender<bool>,
+    },
     SftpReady {
         session_id: String,
-        /// Current working directory from SFTP session
         cwd: String,
     },
-    /// SFTP initialization failed
     SftpError {
         session_id: String,
         error: String,
     },
-    /// SFTP directory listing result
     SftpListResult {
         session_id: String,
+        request_id: RequestId,
         path: String,
-        entries: Vec<FileEntryInfo>,
+        result: Result<Vec<FileEntryInfo>, String>,
     },
-    /// SFTP transfer progress
+    SftpOperationResult {
+        session_id: String,
+        request_id: RequestId,
+        path: String,
+        result: Result<(), String>,
+    },
     SftpTransferProgress {
         session_id: String,
-        transfer_id: u64,
+        transfer_id: TransferId,
         bytes_transferred: u64,
         total_bytes: u64,
     },
-    /// SFTP transfer complete
     SftpTransferComplete {
         session_id: String,
-        transfer_id: u64,
-        success: bool,
-        error: Option<String>,
+        transfer_id: TransferId,
+        outcome: TransferOutcome,
     },
 }

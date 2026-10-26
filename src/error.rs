@@ -29,6 +29,12 @@ pub enum SshError {
     InvalidKey,
     #[error("Host key changed")]
     HostKeyChanged,
+    #[error("Host key verification failed: {0}")]
+    HostKeyVerification(String),
+    #[error("Host key was not accepted")]
+    HostKeyRejected,
+    #[error("Connection cancelled")]
+    Cancelled,
     #[error("Network lost")]
     NetworkLost,
     #[error("SSH protocol error: {0}")]
@@ -67,6 +73,12 @@ pub enum PtyError {
 pub enum SftpError {
     #[error("SFTP not connected")]
     NotConnected,
+    #[error("Transfer cancelled")]
+    Cancelled,
+    #[error("Destination already exists: {path}")]
+    AlreadyExists { path: String },
+    #[error("Unsupported operation: {0}")]
+    Unsupported(String),
     #[error("Permission denied: {path}")]
     PermissionDenied { path: String },
     #[error("File not found: {path}")]

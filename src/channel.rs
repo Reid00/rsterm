@@ -29,7 +29,12 @@ impl AppChannels {
     pub fn new() -> Self {
         let (command_tx, command_rx) = mpsc::channel(256);
         let (event_tx, event_rx) = mpsc::channel(256);
-        Self { command_tx, command_rx, event_tx, event_rx }
+        Self {
+            command_tx,
+            command_rx,
+            event_tx,
+            event_rx,
+        }
     }
 }
 

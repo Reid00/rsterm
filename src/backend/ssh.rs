@@ -1,36 +1,35 @@
-// src/backend/ssh.rs
-//! SSH PTY backend implementation using russh
-//!
-//! Uses an actor pattern where a single task owns the channel
-//! and processes commands from a command channel.
-
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
-use russh::client::{Config, Handle, Handler, Msg};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+use russh::client::{Config, DisconnectReason, Handle, Handler, Msg};
 use russh::{Channel, ChannelMsg, Disconnect};
-use tokio::sync::mpsc as tokio_mpsc;
-use tracing::{error, info, warn};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio_util::sync::CancellationToken;
 
-use crate::backend::PtyBackend;
-use crate::error::{PtyError, SshError};
+use crate::backend::BackendEvent;
+use crate::error::SshError;
 use crate::sftp::SftpClient;
 use crate::ssh::{HostKeyVerification, KnownHosts};
 
-/// SSH connection configuration for creating a session
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SshConnectionConfig {
     pub host: String,
     pub port: u16,
     pub username: String,
     pub auth: SshAuthMethod,
-    /// Optional known hosts database for host key verification.
-    /// If None, host key verification is skipped (insecure).
-    pub known_hosts: Option<KnownHosts>,
+    pub known_hosts: KnownHosts,
+    pub timeout: Duration,
+    pub keepalive_interval: Duration,
+    pub keepalive_max: u32,
 }
 
-/// SSH authentication method
-#[derive(Debug)]
+#[derive(Clone)]
 pub enum SshAuthMethod {
     Password(String),
     Key {
@@ -40,441 +39,480 @@ pub enum SshAuthMethod {
     Agent,
 }
 
-/// Commands sent to the SSH actor task
-enum SshCommand {
-    Write(Vec<u8>),
-    Resize { cols: u16, rows: u16 },
-    Kill,
-}
-
-/// SSH PTY implementation using russh
-pub struct SshPty {
-    alive: Arc<AtomicBool>,
-    command_tx: tokio_mpsc::Sender<SshCommand>,
-    /// SFTP client (created during session setup, cached here)
-    sftp: Arc<tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<SftpClient>>>>>,
-}
-
-/// Client handler for russh
-struct Client {
-    /// Host being connected to
-    host: String,
-    /// Port being connected to
-    port: u16,
-    /// Known hosts database for verification
-    known_hosts: Option<KnownHosts>,
-    /// Result of host key verification (set during check_server_key)
-    verification_result: Option<HostKeyVerification>,
-}
-
-impl Client {
-    /// Create a new client handler
-    fn new(host: String, port: u16, known_hosts: Option<KnownHosts>) -> Self {
-        Self {
-            host,
-            port,
-            known_hosts,
-            verification_result: None,
-        }
+impl fmt::Debug for SshAuthMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Password(_) => "Password([redacted])",
+            Self::Key { .. } => "Key([redacted])",
+            Self::Agent => "Agent",
+        })
     }
+}
+
+struct Client {
+    session_id: String,
+    host: String,
+    port: u16,
+    known_hosts: KnownHosts,
+    events: mpsc::Sender<BackendEvent>,
+    cancel: CancellationToken,
+    disconnected: watch::Sender<Option<String>>,
+    failure: Arc<parking_lot::Mutex<Option<SshError>>>,
 }
 
 #[async_trait::async_trait]
 impl Handler for Client {
-    type Error = russh::Error;
+    type Error = SshError;
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &russh_keys::key::PublicKey,
-    ) -> Result<bool, Self::Error> {
-        match &self.known_hosts {
-            Some(known_hosts) => {
-                let result = known_hosts.verify(&self.host, self.port, server_public_key);
-
-                match &result {
-                    HostKeyVerification::Trusted => {
-                        info!("Host key verified for {}:{}", self.host, self.port);
-                        self.verification_result = Some(result);
-                        Ok(true)
-                    }
-                    HostKeyVerification::Unknown => {
-                        // TOFU: Trust On First Use - accept unknown hosts
-                        info!(
-                            "Unknown host {}:{}, accepting key (TOFU)",
-                            self.host, self.port
-                        );
-                        // Add to pending so it's available for this session
-                        known_hosts.add_pending(&self.host, self.port, server_public_key.clone());
-                        // Save to known_hosts file
-                        if let Err(e) = known_hosts.add(&self.host, self.port, server_public_key) {
-                            warn!("Failed to save known_hosts: {}", e);
-                        }
-                        self.verification_result = Some(result);
-                        Ok(true)
-                    }
-                    HostKeyVerification::Changed { line } => {
-                        // Key changed - potential MITM, reject
-                        warn!(
-                            "Host key changed for {}:{} at line {}, rejecting connection",
-                            self.host, self.port, line
-                        );
-                        self.verification_result = Some(result);
-                        Ok(false)
-                    }
-                }
+        key: &russh_keys::key::PublicKey,
+    ) -> Result<bool, SshError> {
+        match self.verify_server_key(key).await {
+            Ok(trusted) => Ok(trusted),
+            Err(error) => {
+                let message = error.to_string();
+                *self.failure.lock() = Some(error);
+                Err(SshError::HostKeyVerification(message))
             }
-            None => {
-                // No known_hosts configured - accept all keys (insecure)
-                warn!(
-                    "No known_hosts configured, accepting key for {}:{} (insecure)",
-                    self.host, self.port
-                );
-                self.verification_result = Some(HostKeyVerification::Unknown);
+        }
+    }
+
+    async fn disconnected(
+        &mut self,
+        reason: DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        let message = match reason {
+            DisconnectReason::ReceivedDisconnect(info) => format!("Server disconnected: {info:?}"),
+            DisconnectReason::Error(error) => error.to_string(),
+        };
+        let _ = self.disconnected.send(Some(message));
+        Ok(())
+    }
+}
+
+impl Client {
+    async fn verify_server_key(&self, key: &russh_keys::key::PublicKey) -> Result<bool, SshError> {
+        let known = self.known_hosts.clone();
+        let host = self.host.clone();
+        let port = self.port;
+        let public_key = key.clone();
+        let verification =
+            tokio::task::spawn_blocking(move || known.verify(&host, port, &public_key))
+                .await
+                .map_err(|error| SshError::HostKeyVerification(error.to_string()))?
+                .map_err(|error| SshError::HostKeyVerification(error.to_string()))?;
+        match verification {
+            HostKeyVerification::Trusted => Ok(true),
+            HostKeyVerification::Changed { .. } => Err(SshError::HostKeyChanged),
+            HostKeyVerification::Unknown => {
+                let (respond_to, response) = oneshot::channel();
+                let prompt = BackendEvent::HostKeyPrompt {
+                    session_id: self.session_id.clone(),
+                    host: self.host.clone(),
+                    port: self.port,
+                    algorithm: key.name().to_string(),
+                    fingerprint: format!("SHA256:{}", key.fingerprint()),
+                    respond_to,
+                };
+                tokio::select! {
+                    biased;
+                    _ = self.cancel.cancelled() => return Err(SshError::Cancelled),
+                    result = self.events.send(prompt) => result.map_err(|_| SshError::HostKeyRejected)?,
+                }
+                let accepted = tokio::select! {
+                    biased;
+                    _ = self.cancel.cancelled() => return Err(SshError::Cancelled),
+                    result = response => result.unwrap_or(false),
+                };
+                if !accepted {
+                    return Err(SshError::HostKeyRejected);
+                }
+                let known = self.known_hosts.clone();
+                let host = self.host.clone();
+                let public_key = key.clone();
+                tokio::task::spawn_blocking(move || known.add(&host, port, &public_key))
+                    .await
+                    .map_err(|error| SshError::HostKeyVerification(error.to_string()))?
+                    .map_err(|error| SshError::HostKeyVerification(error.to_string()))?;
                 Ok(true)
             }
         }
     }
 }
 
-impl SshPty {
-    /// Create a new SSH PTY connection (async version for use within tokio runtime)
-    pub async fn new_async(
+pub struct SshTransport {
+    session: Arc<Handle<Client>>,
+    disconnected: watch::Receiver<Option<String>>,
+    timeout: Duration,
+    cancel: CancellationToken,
+}
+
+impl SshTransport {
+    pub async fn connect(
         config: &SshConnectionConfig,
-        cols: u16,
-        rows: u16,
-        output_tx: tokio_mpsc::Sender<Vec<u8>>,
+        session_id: String,
+        events: mpsc::Sender<BackendEvent>,
+        cancel: CancellationToken,
     ) -> Result<Self, SshError> {
-        info!("Connecting to SSH server {}:{}", config.host, config.port);
-
-        // Connect and set up PTY with timeout
-        let (session, channel) = match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            connect_and_setup_pty(config, cols, rows)
-        ).await {
-            Ok(result) => result?,
-            Err(_) => return Err(SshError::Protocol("Connection timeout (30s)".to_string())),
+        if config.host.is_empty()
+            || config.host.chars().any(char::is_whitespace)
+            || config.host.contains([',', '\0', '*', '?', '!', '|'])
+        {
+            return Err(SshError::Protocol("Invalid SSH host name".into()));
+        }
+        if config.port == 0
+            || config.username.is_empty()
+            || config.username.contains('\0')
+            || config.timeout.is_zero()
+            || config.keepalive_interval.is_zero()
+            || config.keepalive_max == 0
+        {
+            return Err(SshError::Protocol("Invalid SSH connection settings".into()));
+        }
+        let (disconnected_tx, disconnected) = watch::channel(None);
+        let failure = Arc::new(parking_lot::Mutex::new(None));
+        let transport_cancel = cancel.child_token();
+        let disconnect_error = disconnected.clone();
+        let client = Client {
+            session_id,
+            host: config.host.clone(),
+            port: config.port,
+            known_hosts: config.known_hosts.clone(),
+            events,
+            cancel: transport_cancel.clone(),
+            disconnected: disconnected_tx,
+            failure: failure.clone(),
         };
-
-        let alive = Arc::new(AtomicBool::new(true));
-        let (command_tx, command_rx) = tokio_mpsc::channel::<SshCommand>(64);
-
-        // Create SFTP client storage
-        let sftp: Arc<tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<SftpClient>>>>> = Arc::new(tokio::sync::Mutex::new(None));
-
-        // Spawn the actor task that owns the channel
-        let alive_clone = alive.clone();
-        let sftp_clone = sftp.clone();
-        tokio::spawn(async move {
-            // Create SFTP client
-            match SftpClient::new(&session).await {
-                Ok(sftp_client) => {
-                    *sftp_clone.lock().await = Some(Arc::new(tokio::sync::Mutex::new(sftp_client)));
-                    info!("SFTP client initialized");
-                }
-                Err(e) => {
-                    warn!("Failed to create SFTP client: {}", e);
-                }
-            }
-            ssh_actor(channel, session, command_rx, output_tx, alive_clone).await;
+        let ssh_config = Arc::new(Config {
+            keepalive_interval: Some(config.keepalive_interval),
+            keepalive_max: config.keepalive_max as usize,
+            ..Config::default()
         });
+        let connection = async {
+            let socket =
+                tokio::net::TcpStream::connect((config.host.as_str(), config.port)).await?;
+            let stream = CancellableStream {
+                stream: socket,
+                cancelled: Box::pin(transport_cancel.clone().cancelled_owned()),
+            };
+            let mut session = russh::client::connect_stream(ssh_config, stream, client).await?;
+            let authentication = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(SshError::Cancelled),
+                result = authenticate(&mut session, config) => result,
+            };
+            if let Err(error) = authentication {
+                let _ = session
+                    .disconnect(Disconnect::ByApplication, "Authentication ended", "en")
+                    .await;
+                return Err(error);
+            }
+            Ok(Self {
+                session: Arc::new(session),
+                disconnected,
+                timeout: config.timeout,
+                cancel: transport_cancel.clone(),
+            })
+        };
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(SshError::Cancelled),
+            result = tokio::time::timeout(config.timeout, connection) => result.unwrap_or_else(|_| Err(SshError::ConnectionTimeout {
+                host: config.host.clone(), port: config.port,
+            })),
+        };
+        if result.is_err() {
+            transport_cancel.cancel();
+            if let Some(error) = failure.lock().take() {
+                return Err(error);
+            }
+            if matches!(result, Err(SshError::Russh(russh::Error::Disconnect))) {
+                if let Some(error) = disconnect_error.borrow().clone() {
+                    return Err(SshError::Protocol(error));
+                }
+            }
+        }
+        result
+    }
 
-        Ok(Self {
-            alive,
-            command_tx,
-            sftp,
+    pub async fn open_shell(&self, cols: u16, rows: u16) -> Result<Channel<Msg>, SshError> {
+        tokio::time::timeout(self.timeout, async {
+            let mut channel = self.session.channel_open_session().await?;
+            channel
+                .request_pty(true, "xterm-256color", cols.into(), rows.into(), 0, 0, &[])
+                .await?;
+            wait_request_reply(&mut channel).await?;
+            channel.request_shell(true).await?;
+            wait_request_reply(&mut channel).await?;
+            Ok(channel)
         })
+        .await
+        .map_err(|_| SshError::Protocol("Shell setup timed out".into()))?
     }
 
-    /// Try to get an SFTP client from this SSH session (internal method)
-    async fn try_get_sftp(&self) -> Option<Arc<tokio::sync::Mutex<SftpClient>>> {
-        let guard = self.sftp.lock().await;
-        guard.clone()
+    pub async fn sftp(&self) -> Result<SftpClient, crate::error::SftpError> {
+        SftpClient::new(self.session.as_ref(), self.timeout).await
+    }
+
+    pub(crate) async fn open_inspection_channel(&self) -> Result<Channel<Msg>, russh::Error> {
+        self.session.channel_open_session().await
+    }
+
+    pub(crate) fn stop_stream(&self) {
+        self.cancel.cancel();
+    }
+
+    pub fn disconnection(&self) -> watch::Receiver<Option<String>> {
+        self.disconnected.clone()
+    }
+
+    pub async fn disconnect(&self) {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            self.session
+                .disconnect(Disconnect::ByApplication, "Session closed", "en"),
+        )
+        .await;
+        self.cancel.cancel();
     }
 }
 
-/// Actor task that owns the SSH channel and processes commands
-async fn ssh_actor(
-    mut channel: Channel<Msg>,
-    session: Handle<Client>,
-    mut command_rx: tokio_mpsc::Receiver<SshCommand>,
-    output_tx: tokio_mpsc::Sender<Vec<u8>>,
-    alive: Arc<AtomicBool>,
-) {
+impl Drop for SshTransport {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+struct CancellableStream {
+    stream: tokio::net::TcpStream,
+    cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl AsyncRead for CancellableStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.cancelled.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(std::io::ErrorKind::ConnectionAborted.into()));
+        }
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for CancellableStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.cancelled.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(std::io::ErrorKind::ConnectionAborted.into()));
+        }
+        Pin::new(&mut self.stream).poll_write(cx, data)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.cancelled.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(std::io::ErrorKind::ConnectionAborted.into()));
+        }
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+pub(crate) async fn wait_request_reply(channel: &mut Channel<Msg>) -> Result<(), SshError> {
     loop {
-        tokio::select! {
-            // Handle commands from the application
-            Some(cmd) = command_rx.recv() => {
-                match cmd {
-                    SshCommand::Write(data) => {
-                        if let Err(e) = channel.data(&data[..]).await {
-                            error!("Failed to write to SSH channel: {}", e);
-                            alive.store(false, Ordering::Relaxed);
-                            break;
-                        }
-                    }
-                    SshCommand::Resize { cols, rows } => {
-                        if let Err(e) = channel.window_change(cols as u32, rows as u32, 0, 0).await {
-                            error!("Failed to resize SSH channel: {}", e);
-                        }
-                    }
-                    SshCommand::Kill => {
-                        info!("SSH kill command received");
-                        let _ = channel.close().await;
-                        let _ = session.disconnect(Disconnect::ByApplication, "Closing", "English").await;
-                        alive.store(false, Ordering::Relaxed);
-                        break;
-                    }
-                }
+        match channel.wait().await {
+            Some(ChannelMsg::Success) => return Ok(()),
+            Some(ChannelMsg::Failure) => {
+                return Err(SshError::Protocol("Server rejected channel request".into()))
             }
-
-            // Handle messages from the SSH channel
-            Some(msg) = channel.wait() => {
-                match msg {
-                    ChannelMsg::Data { ref data } => {
-                        if output_tx.send(data.to_vec()).await.is_err() {
-                            info!("Output channel closed, stopping SSH actor");
-                            alive.store(false, Ordering::Relaxed);
-                            break;
-                        }
-                    }
-                    ChannelMsg::ExtendedData { ref data, ext: _ } => {
-                        // stderr data - also send to output
-                        if output_tx.send(data.to_vec()).await.is_err() {
-                            info!("Output channel closed, stopping SSH actor");
-                            alive.store(false, Ordering::Relaxed);
-                            break;
-                        }
-                    }
-                    ChannelMsg::Eof => {
-                        info!("SSH channel EOF received");
-                        alive.store(false, Ordering::Relaxed);
-                        break;
-                    }
-                    ChannelMsg::Close => {
-                        info!("SSH channel closed");
-                        alive.store(false, Ordering::Relaxed);
-                        break;
-                    }
-                    ChannelMsg::ExitStatus { exit_status } => {
-                        info!("SSH process exited with status: {}", exit_status);
-                        // Don't break - there might be more data
-                    }
-                    ChannelMsg::ExitSignal {
-                        signal_name,
-                        core_dumped,
-                        error_message,
-                        ..
-                    } => {
-                        error!(
-                            "SSH process killed by signal {:?}: {} (core: {})",
-                            signal_name, error_message, core_dumped
-                        );
-                    }
-                    _ => {
-                        // Ignore other messages
-                    }
-                }
+            Some(ChannelMsg::Close | ChannelMsg::Eof) | None => {
+                return Err(SshError::ChannelClosed)
             }
-
-            else => {
-                // Both channels closed
-                alive.store(false, Ordering::Relaxed);
-                break;
-            }
+            _ => {}
         }
     }
-
-    info!("SSH actor task ended");
 }
 
-async fn connect_and_setup_pty(
+async fn authenticate(
+    session: &mut Handle<Client>,
     config: &SshConnectionConfig,
-    cols: u16,
-    rows: u16,
-) -> Result<(Handle<Client>, Channel<Msg>), SshError> {
-    // Configure SSH session
-    let ssh_config = Arc::new(Config::default());
-
-    // Create client handler with known hosts
-    let client = Client::new(
-        config.host.clone(),
-        config.port,
-        config.known_hosts.clone(),
-    );
-
-    // Connect to server and perform handshake
-    let mut session = russh::client::connect(
-        ssh_config,
-        (config.host.as_str(), config.port),
-        client,
-    )
-    .await
-    .map_err(|e| SshError::Protocol(format!("Connection failed: {}", e)))?;
-
-    // Authenticate based on method
-    match &config.auth {
+) -> Result<(), SshError> {
+    let authenticated = match &config.auth {
         SshAuthMethod::Password(password) => {
-            let success = session
+            session
                 .authenticate_password(&config.username, password)
-                .await
-                .map_err(|e| SshError::AuthFailed { reason: e.to_string() })?;
-
-            if !success {
-                return Err(SshError::AuthFailed {
-                    reason: "Password authentication rejected".to_string(),
-                });
-            }
+                .await?
         }
-        SshAuthMethod::Key { private_key, passphrase } => {
-            let key_str = std::str::from_utf8(private_key)
-                .map_err(|_| SshError::InvalidKey)?;
-            let key_pair = russh_keys::decode_secret_key(key_str, passphrase.as_deref())
-                .map_err(|e| {
-                    error!("Failed to decode key: {}", e);
-                    SshError::InvalidKey
-                })?;
-
-            let success = session
-                .authenticate_publickey(&config.username, Arc::new(key_pair))
-                .await
-                .map_err(|e| SshError::AuthFailed { reason: e.to_string() })?;
-
-            if !success {
-                return Err(SshError::AuthFailed {
-                    reason: "Key authentication rejected".to_string(),
-                });
-            }
+        SshAuthMethod::Key {
+            private_key,
+            passphrase,
+        } => {
+            let private_key = private_key.clone();
+            let passphrase = passphrase.clone();
+            let key = tokio::task::spawn_blocking(move || {
+                let text = std::str::from_utf8(&private_key).map_err(|_| SshError::InvalidKey)?;
+                russh_keys::decode_secret_key(text, passphrase.as_deref())
+                    .map_err(|_| SshError::InvalidKey)
+            })
+            .await
+            .map_err(|_| SshError::InvalidKey)??;
+            session
+                .authenticate_publickey(&config.username, Arc::new(key))
+                .await?
         }
         SshAuthMethod::Agent => {
-            // Use SSH agent for authentication
             let mut agent = russh_keys::agent::client::AgentClient::connect_env()
                 .await
-                .map_err(|e| {
-                    SshError::AuthFailed {
-                        reason: format!(
-                            "Failed to connect to SSH agent: {}. Is ssh-agent running?",
-                            e
-                        ),
-                    }
+                .map_err(|error| SshError::AuthFailed {
+                    reason: error.to_string(),
                 })?;
-
-            // Get identities (public keys) from agent and try each one
-            let identities = agent
-                .request_identities()
-                .await
-                .map_err(|e| SshError::AuthFailed {
-                    reason: format!("Failed to get identities from agent: {}", e),
-                })?;
-
-            let mut authenticated = false;
+            let identities =
+                agent
+                    .request_identities()
+                    .await
+                    .map_err(|error| SshError::AuthFailed {
+                        reason: error.to_string(),
+                    })?;
+            let mut success = false;
             for identity in identities {
-                // authenticate_future takes (user, public_key, signer)
-                // and returns (signer, result) - we need to get the agent back
                 let (returned_agent, result) = session
                     .authenticate_future(&config.username, identity, agent)
                     .await;
-
-                // Update agent for next iteration
                 agent = returned_agent;
-
-                match result {
-                    Ok(success) if success => {
-                        authenticated = true;
-                        break;
-                    }
-                    Ok(_) => continue, // Try next key
-                    Err(e) => {
-                        error!("Agent auth error for key: {}", e);
-                        continue;
-                    }
+                if result.map_err(|error| SshError::AuthFailed {
+                    reason: error.to_string(),
+                })? {
+                    success = true;
+                    break;
                 }
             }
+            success
+        }
+    };
+    if authenticated {
+        Ok(())
+    } else {
+        Err(SshError::AuthFailed {
+            reason: "Authentication rejected".into(),
+        })
+    }
+}
 
-            if !authenticated {
-                return Err(SshError::AuthFailed {
-                    reason: "Agent authentication failed - no valid keys".to_string(),
-                });
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secrets_are_redacted() {
+        assert!(!format!("{:?}", SshAuthMethod::Password("secret".into())).contains("secret"));
+        assert!(!format!(
+            "{:?}",
+            SshAuthMethod::Key {
+                private_key: b"secret".to_vec(),
+                passphrase: Some("secret".into())
             }
+        )
+        .contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn unknown_host_requires_acceptance_and_rejection_is_not_saved() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let known_hosts = KnownHosts::load_from(file.path().to_path_buf()).unwrap();
+        let (events, mut rx) = mpsc::channel(1);
+        let (disconnected, _) = watch::channel(None);
+        let client = Client {
+            session_id: "s".into(),
+            host: "host".into(),
+            port: 22,
+            known_hosts: known_hosts.clone(),
+            events,
+            cancel: CancellationToken::new(),
+            disconnected,
+            failure: Arc::new(parking_lot::Mutex::new(None)),
+        };
+        let key = russh_keys::key::KeyPair::generate_ed25519()
+            .unwrap()
+            .clone_public_key()
+            .unwrap();
+        let checking = tokio::spawn(async move { client.verify_server_key(&key).await });
+        match rx.recv().await.unwrap() {
+            BackendEvent::HostKeyPrompt { respond_to, .. } => respond_to.send(false).unwrap(),
+            _ => panic!("Expected host prompt"),
         }
+        assert!(matches!(
+            checking.await.unwrap(),
+            Err(SshError::HostKeyRejected)
+        ));
+        assert!(std::fs::read_to_string(file.path()).unwrap().is_empty());
     }
 
-    info!("SSH authentication successful for user {}", config.username);
-
-    // Open a channel and request PTY
-    let channel = session
-        .channel_open_session()
-        .await
-        .map_err(|e| SshError::Protocol(format!("Failed to open session: {}", e)))?;
-
-    // Request PTY with terminal type
-    channel
-        .request_pty(true, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
-        .await
-        .map_err(|e| SshError::Protocol(format!("Failed to request PTY: {}", e)))?;
-
-    // Request shell
-    channel
-        .exec(true, "bash")
-        .await
-        .map_err(|e| SshError::Protocol(format!("Failed to start shell: {}", e)))?;
-
-    info!("SSH PTY session established ({}x{})", cols, rows);
-
-    Ok((session, channel))
-}
-
-#[async_trait::async_trait]
-impl PtyBackend for SshPty {
-    async fn write(&self, data: &[u8]) -> Result<(), PtyError> {
-        if !self.alive.load(Ordering::Relaxed) {
-            return Err(PtyError::ProcessExited);
-        }
-
-        self.command_tx
-            .send(SshCommand::Write(data.to_vec()))
-            .await
-            .map_err(|_| PtyError::ProcessExited)?;
-
-        Ok(())
+    #[tokio::test]
+    async fn mismatch_and_database_errors_never_offer_acceptance() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let known_hosts = KnownHosts::load_from(file.path().to_path_buf()).unwrap();
+        let first = russh_keys::key::KeyPair::generate_ed25519()
+            .unwrap()
+            .clone_public_key()
+            .unwrap();
+        let other = russh_keys::key::KeyPair::generate_ed25519()
+            .unwrap()
+            .clone_public_key()
+            .unwrap();
+        known_hosts.add("host", 22, &first).unwrap();
+        let (events, mut rx) = mpsc::channel(2);
+        let (disconnected, _) = watch::channel(None);
+        let client = Client {
+            session_id: "s".into(),
+            host: "host".into(),
+            port: 22,
+            known_hosts,
+            events,
+            cancel: CancellationToken::new(),
+            disconnected,
+            failure: Arc::new(parking_lot::Mutex::new(None)),
+        };
+        assert!(matches!(
+            client.verify_server_key(&other).await,
+            Err(SshError::HostKeyChanged)
+        ));
+        std::fs::write(file.path(), "malformed").unwrap();
+        assert!(matches!(
+            client.verify_server_key(&first).await,
+            Err(SshError::HostKeyVerification(_))
+        ));
+        assert!(rx.try_recv().is_err());
     }
 
-    async fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyError> {
-        if !self.alive.load(Ordering::Relaxed) {
-            return Err(PtyError::ResizeFailed("Channel closed".to_string()));
-        }
-
-        self.command_tx
-            .send(SshCommand::Resize { cols, rows })
-            .await
-            .map_err(|_| PtyError::ResizeFailed("Channel closed".to_string()))?;
-
-        Ok(())
-    }
-
-    fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::Relaxed)
-    }
-
-    fn kill(&self) {
-        info!("Killing SSH session");
-
-        // Send kill command (ignore errors if channel already closed)
-        let _ = self.command_tx.try_send(SshCommand::Kill);
-
-        self.alive.store(false, Ordering::Relaxed);
-    }
-
-    fn supports_sftp(&self) -> bool {
-        true
-    }
-
-    async fn get_sftp(&self) -> Option<Arc<tokio::sync::Mutex<SftpClient>>> {
-        self.try_get_sftp().await
-    }
-}
-
-impl Drop for SshPty {
-    fn drop(&mut self) {
-        self.kill();
+    #[tokio::test]
+    async fn cancellation_unblocks_host_prompt() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let (events, mut rx) = mpsc::channel(1);
+        let (disconnected, _) = watch::channel(None);
+        let cancel = CancellationToken::new();
+        let client = Client {
+            session_id: "s".into(),
+            host: "host".into(),
+            port: 22,
+            known_hosts: KnownHosts::load_from(file.path().to_path_buf()).unwrap(),
+            events,
+            cancel: cancel.clone(),
+            disconnected,
+            failure: Arc::new(parking_lot::Mutex::new(None)),
+        };
+        let key = russh_keys::key::KeyPair::generate_ed25519()
+            .unwrap()
+            .clone_public_key()
+            .unwrap();
+        let checking = tokio::spawn(async move { client.verify_server_key(&key).await });
+        let _prompt = rx.recv().await.unwrap();
+        cancel.cancel();
+        assert!(matches!(checking.await.unwrap(), Err(SshError::Cancelled)));
     }
 }

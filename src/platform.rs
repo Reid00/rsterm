@@ -41,9 +41,7 @@ pub fn shell_args() -> Vec<String> {
 
 /// Get common SSH key paths to search
 pub fn ssh_key_search_paths() -> Vec<PathBuf> {
-    let ssh_dir = dirs::home_dir()
-        .map(|h| h.join(".ssh"))
-        .unwrap_or_default();
+    let ssh_dir = dirs::home_dir().map(|h| h.join(".ssh")).unwrap_or_default();
 
     vec![
         ssh_dir.join("id_ed25519"),
@@ -119,16 +117,12 @@ pub fn open_url(url: &str) -> Result<(), std::io::Error> {
 
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open")
-            .arg(url)
-            .spawn()?;
+        std::process::Command::new("open").arg(url).spawn()?;
     }
 
     #[cfg(target_os = "linux")]
     {
-        std::process::Command::new("xdg-open")
-            .arg(url)
-            .spawn()?;
+        std::process::Command::new("xdg-open").arg(url).spawn()?;
     }
 
     Ok(())

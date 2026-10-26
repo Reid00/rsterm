@@ -1,2 +1,4 @@
 /target
 /docs
+/dist
+/scripts/__pycache__/
