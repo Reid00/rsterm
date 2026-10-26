@@ -53,7 +53,9 @@
       "Bash(cat:*)",
       "Bash(find /c/Users/zhangbl/.cargo/registry/src -name *.rs -path *alacritty_terminal*)",
       "Bash(taskkill /F /IM rsterm.exe)",
-      "Bash(cargo clippy:*)"
+      "Bash(cargo clippy:*)",
+      "Bash(python3 *)",
+      "Bash(curl -L --fail --silent --show-error --max-time 30 -H 'User-Agent: rsterm-local-investigation' https://crates.io/api/v1/crates/accesskit_macos)"
     ]
   }
 }

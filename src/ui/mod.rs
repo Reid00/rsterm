@@ -1,2 +1,11 @@
-// src/ui/mod.rs
-//! egui UI components
+pub mod connection;
+pub mod folders;
+pub mod hosts;
+pub mod inspector;
+pub mod session_tabs;
+pub mod settings;
+pub mod sftp;
+pub mod shortcuts;
+pub mod ssh_import;
+pub mod terminal;
+pub mod transfers;

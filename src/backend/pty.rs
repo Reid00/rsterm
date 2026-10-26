@@ -1,41 +1,28 @@
-// src/backend/pty.rs
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
 use parking_lot::Mutex;
-use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
-use tokio::sync::mpsc as tokio_mpsc;
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use tokio::sync::mpsc;
 
 use crate::error::PtyError;
-use crate::sftp::SftpClient;
 
-/// PTY backend trait - async push model
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait PtyBackend: Send + Sync + 'static {
     async fn write(&self, data: &[u8]) -> Result<(), PtyError>;
     async fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyError>;
     fn is_alive(&self) -> bool;
     fn kill(&self);
-
-    /// Check if this backend supports SFTP (only SSH backends do)
-    fn supports_sftp(&self) -> bool {
-        false
-    }
-
-    /// Get an SFTP client (only implemented by SSH backends)
-    /// Returns None if not supported or if not yet initialized
-    async fn get_sftp(&self) -> Option<Arc<tokio::sync::Mutex<SftpClient>>> {
-        None
-    }
 }
 
-/// Local PTY implementation using portable-pty
 pub struct LocalPty {
-    pair: Arc<Mutex<PtyPair>>,
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Arc<Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>>,
-    alive: Arc<std::sync::atomic::AtomicBool>,
+    alive: Arc<AtomicBool>,
 }
 
 impl LocalPty {
@@ -43,75 +30,54 @@ impl LocalPty {
         shell: &str,
         cols: u16,
         rows: u16,
-        output_tx: tokio_mpsc::Sender<Vec<u8>>,
+        output_tx: mpsc::Sender<Vec<u8>>,
     ) -> Result<Self, PtyError> {
-        let pty_system = native_pty_system();
-        let pair = pty_system
+        let pair = native_pty_system()
             .openpty(PtySize {
                 rows,
                 cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| PtyError::CreationFailed(e.to_string()))?;
-
-        // Spawn shell with proper environment
-        let mut cmd = CommandBuilder::new(shell);
-
-        // Add shell arguments (e.g., -NoLogo for PowerShell)
-        for arg in crate::platform::shell_args() {
-            cmd.arg(arg);
+            .map_err(|error| PtyError::CreationFailed(error.to_string()))?;
+        let mut command = CommandBuilder::new(shell);
+        for argument in crate::platform::shell_args() {
+            command.arg(argument);
         }
-
-        // Add standard terminal environment variables
         for (key, value) in crate::platform::pty_environment() {
-            cmd.env(key, value);
+            command.env(key, value);
         }
-
         let child = pair
             .slave
-            .spawn_command(cmd)
-            .map_err(|e| PtyError::CreationFailed(e.to_string()))?;
-
+            .spawn_command(command)
+            .map_err(|error| PtyError::CreationFailed(error.to_string()))?;
+        drop(pair.slave);
         let writer = pair
             .master
             .take_writer()
-            .map_err(|e| PtyError::CreationFailed(e.to_string()))?;
-
-        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
-
-        // Spawn reader thread
-        let alive_clone = alive.clone();
+            .map_err(|error| PtyError::CreationFailed(error.to_string()))?;
         let mut reader = pair
             .master
             .try_clone_reader()
-            .map_err(|e| PtyError::CreationFailed(e.to_string()))?;
-
+            .map_err(|error| PtyError::CreationFailed(error.to_string()))?;
+        let alive = Arc::new(AtomicBool::new(true));
+        let reader_alive = alive.clone();
         thread::spawn(move || {
-            let mut buf = [0u8; 4096];
+            let mut buffer = [0; 4096];
             loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => {
-                        alive_clone.store(false, std::sync::atomic::Ordering::Relaxed);
-                        break;
-                    }
-                    Ok(n) => {
-                        let data = &buf[..n];
-                        if output_tx.blocking_send(data.to_vec()).is_err() {
+                match reader.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => {
+                        if output_tx.blocking_send(buffer[..count].to_vec()).is_err() {
                             break;
                         }
                     }
-                    Err(e) => {
-                        tracing::error!("PTY read error: {}", e);
-                        alive_clone.store(false, std::sync::atomic::Ordering::Relaxed);
-                        break;
-                    }
                 }
             }
+            reader_alive.store(false, Ordering::Release);
         });
-
         Ok(Self {
-            pair: Arc::new(Mutex::new(pair)),
+            master: Arc::new(Mutex::new(pair.master)),
             writer: Arc::new(Mutex::new(writer)),
             child: Arc::new(Mutex::new(Some(child))),
             alive,
@@ -122,32 +88,53 @@ impl LocalPty {
 #[async_trait::async_trait]
 impl PtyBackend for LocalPty {
     async fn write(&self, data: &[u8]) -> Result<(), PtyError> {
-        let mut writer = self.writer.lock();
-        writer.write_all(data)?;
-        writer.flush()?;
-        Ok(())
+        let writer = self.writer.clone();
+        let data = data.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let mut writer = writer.lock();
+            writer.write_all(&data)?;
+            writer.flush()?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| PtyError::CreationFailed(error.to_string()))?
     }
 
     async fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyError> {
-        let pair = self.pair.lock();
-        pair.master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| PtyError::ResizeFailed(e.to_string()))?;
-        Ok(())
+        let master = self.master.clone();
+        tokio::task::spawn_blocking(move || {
+            master
+                .lock()
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|error| PtyError::ResizeFailed(error.to_string()))
+        })
+        .await
+        .map_err(|error| PtyError::ResizeFailed(error.to_string()))?
     }
 
     fn is_alive(&self) -> bool {
-        self.alive.load(std::sync::atomic::Ordering::Relaxed)
+        self.alive.load(Ordering::Acquire)
     }
 
     fn kill(&self) {
-        if let Some(mut child) = self.child.lock().take() {
-            let _ = child.kill();
-        }
+        self.alive.store(false, Ordering::Release);
+        let child = self.child.clone();
+        thread::spawn(move || {
+            if let Some(mut child) = child.lock().take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        });
+    }
+}
+
+impl Drop for LocalPty {
+    fn drop(&mut self) {
+        self.kill();
     }
 }

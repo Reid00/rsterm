@@ -1,16 +1,15 @@
 // src/lib.rs
-pub mod terminal_v2;
-pub mod backend;
-pub mod config;
-pub mod ui;
-pub mod channel;
-pub mod state;
-pub mod error;
-pub mod platform;
-pub mod fonts;
 pub mod app;
-pub mod ssh;
+pub mod backend;
+pub mod channel;
+pub mod config;
+pub mod error;
+pub mod fonts;
+pub mod inspection;
+pub mod platform;
 pub mod sftp;
-
-// Re-export terminal_v2 as terminal for backwards compatibility
-pub use terminal_v2 as terminal;
+pub mod shortcuts;
+pub mod ssh;
+pub mod state;
+pub mod terminal_v2;
+pub mod ui;

@@ -1,113 +1,88 @@
-// src/main.rs
-use rsterm::app::App;
-use rsterm::backend::backend_loop;
-use rsterm::channel::AppChannels;
+use std::sync::Arc;
 
-fn main() -> eframe::Result<()> {
-    // Initialize logging
+use gpui_kit::{prelude::*, *};
+use rsterm::{
+    app::App as RstermApp, backend::backend_loop, channel::AppChannels, config::ConfigManager,
+    ssh::SshConfigSource,
+};
+
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("rsterm=debug".parse().unwrap()),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive("rsterm=info".parse()?),
         )
         .init();
-
-    // Create channels
-    let channels = AppChannels::new();
-
-    // Create tokio runtime
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .expect("Failed to create Tokio runtime");
-
-    // Spawn backend loop
-    let event_tx = channels.event_tx.clone();
-    let command_rx = channels.command_rx;
+    let config = ConfigManager::new()?;
+    let shortcuts = config.load_keybindings();
+    let ssh_source = dirs::home_dir().map(|home| SshConfigSource {
+        path: home.join(".ssh/config"),
+        home,
+    });
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?,
+    );
+    let AppChannels {
+        command_tx,
+        command_rx,
+        event_tx,
+        event_rx,
+    } = AppChannels::new();
+    let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
     runtime.spawn(async move {
         backend_loop(command_rx, event_tx).await;
+        let _ = stopped_tx.send(());
     });
 
-    // Check for renderer override via environment variable
-    // Options: "wgpu" (default), "glow" (OpenGL)
-    let renderer = match std::env::var("RSTERM_RENDERER")
-        .unwrap_or_default()
-        .as_str()
-    {
-        "glow" => eframe::Renderer::Glow,
-        _ => eframe::Renderer::Wgpu,
-    };
-
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("RSTerm")
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([800.0, 600.0]),
-        renderer,
-        ..Default::default()
-    };
-
-    // Move remaining channel parts into App
-    let command_tx = channels.command_tx;
-    let event_rx = channels.event_rx;
-
-    let result = eframe::run_native(
-        "RSTerm",
-        options,
-        Box::new(move |cc| {
-            // Set up fonts with CJK support
-            let mut fonts = egui::FontDefinitions::default();
-
-            // Try to load system CJK fonts at runtime
-            if let Ok(cjk_font) = std::fs::read("C:/Windows/Fonts/msyh.ttc") {
-                fonts.font_data.insert(
-                    "cjk".to_owned(),
-                    egui::FontData::from_owned(cjk_font),
-                );
-                // Add CJK to monospace font family as fallback
-                fonts
-                    .families
-                    .entry(egui::FontFamily::Monospace)
-                    .or_default()
-                    .push("cjk".to_owned());
-                // Also add to proportional for UI text
-                fonts
-                    .families
-                    .entry(egui::FontFamily::Proportional)
-                    .or_default()
-                    .push("cjk".to_owned());
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::Assets)
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            rsterm::ui::terminal::init(cx);
+            let shutdown_sender = command_tx.clone();
+            let shutdown_runtime = runtime.clone();
+            let mut stopped_rx = Some(stopped_rx);
+            cx.on_app_quit(move |_| {
+                let sender = shutdown_sender.clone();
+                let runtime = shutdown_runtime.clone();
+                let stopped = stopped_rx.take();
+                async move {
+                    let _runtime = runtime;
+                    let _ = sender.send(rsterm::backend::AppCommand::Shutdown).await;
+                    if let Some(stopped) = stopped {
+                        let _ = stopped.await;
+                    }
+                }
+            })
+            .detach();
+            rsterm::shortcuts::init(shortcuts, cx);
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(1280.), px(820.)),
+                    cx,
+                ))),
+                window_min_size: Some(size(px(860.), px(600.))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("RSTerm".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            if let Err(error) = gpui_kit::open_window(options, cx, move |window, cx| {
+                let app = cx.new(|cx| {
+                    RstermApp::new(
+                        config, ssh_source, command_tx, event_rx, runtime, window, cx,
+                    )
+                });
+                app.update(cx, |app, cx| app.load(window, cx));
+                app
+            }) {
+                tracing::error!(%error, "Unable to open RSTerm window");
+                cx.quit();
             }
-
-            cc.egui_ctx.set_fonts(fonts);
-
-            Ok(Box::new(App::new(command_tx, event_rx, runtime)))
-        }),
-    );
-
-    // Provide helpful error message for rendering failures
-    if let Err(e) = &result {
-        let err_str = format!("{:?}", e);
-        let err_display = e.to_string();
-        if err_str.contains("NoSuitableAdapterFound")
-            || err_display.contains("NoSuitableAdapterFound")
-            || err_display.contains("opengl 2.0")
-            || err_str.contains("opengl 2.0")
-        {
-            eprintln!("\n========================================");
-            eprintln!("RSTerm requires a graphics driver to run.");
-            eprintln!("\nDetected issue: No suitable GPU or OpenGL driver found.");
-            eprintln!("\nPossible solutions:");
-            eprintln!("  1. Run on a machine with a proper GPU/display driver");
-            eprintln!("  2. For Remote Desktop: Enable GPU redirection or use local display");
-            eprintln!("  3. Install Mesa3D software renderer (llvmpipe)");
-            eprintln!("     Download from: https://github.com/pal1000/mesa-dist-win");
-            eprintln!("  4. Try environment variables:");
-            eprintln!("     set RSTERM_RENDERER=wgpu");
-            eprintln!("     set WGPU_BACKEND=gl");
-            eprintln!("========================================\n");
-        }
-    }
-
-    result
+            cx.activate(true);
+        });
+    Ok(())
 }
