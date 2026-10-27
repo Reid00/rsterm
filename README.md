@@ -21,7 +21,9 @@ cargo run --locked
 
 ## GitHub 自动构建与下载
 
-`.github/workflows/build.yml` 在推送到 `main`、提交 Pull Request、手动运行或推送 `v*` 标签时构建。macOS 质量检查通过后，版本标签才可生成 Draft Release；普通构建不创建 Release。首次云端构建仍需推送后在 Actions 中确认，配置存在不代表四个平台已经验证通过。
+`.github/workflows/build.yml` 在推送到 `main`、提交 Pull Request、手动运行、推送 `v*` 标签或发布 Release 时构建。普通构建提供 Actions Artifacts；发布构建在所有质量检查和四目标构建成功后，将程序包及 SHA-256 附加到对应 Release，不再因为 Release 已存在而直接失败。首次云端构建仍需推送后在 Actions 中确认，配置存在不代表四个平台已经验证通过。
+
+GitHub 自动显示的 **Source code (zip / tar.gz)** 只是源码快照，不是可运行程序。二进制在工作流成功后才会出现在 Release 的 Assets 中，源码归档仍会保留。
 
 完整测试与严格 Clippy 在 macOS 执行；Windows / Linux 先编译包括测试代码在内的所有 targets，再构建 release，不执行仍含 macOS 按键或 Unix 路径假设的全套测试。四目标编译成功也不等于这些平台的原生界面、输入法和连接功能已经验收。
 
@@ -29,7 +31,7 @@ cargo run --locked
 
 1. 推送前检查 `git status --short` 和实际差异，把新增的 `src/` 模块、`scripts/`、工作流、工具链文件及 `Cargo.lock` 一起提交，避免漏掉尚未跟踪的源码。
 2. 不要使用未经检查的 `git add .`；排除个人 `.claude` 设置、主机配置、密码、私钥和构建缓存。当前已跟踪的个人文件也需要单独检查，`.gitignore` 不会自动取消跟踪。
-3. 推送后进入仓库 **Actions → Build binaries → Run workflow**，选择分支并运行。PR 和 `main` 推送也会自动执行。
+3. 推送后进入仓库 **Actions → Build binaries → Run workflow**，选择分支，保持 `release_tag` 为空并运行。PR 和 `main` 推送也会自动执行。不填标签时只生成 Artifacts，不修改 Release。
 4. 等待质量检查与四个平台的构建 job 完成，在运行页面底部的 **Artifacts** 下载对应目标。Artifacts 保留 30 天；下载后先解开 GitHub 外层归档，里面包含程序包及同名 `.sha256` 校验文件。
 
 | 使用的机器 | 目标 | 程序包 |
@@ -43,18 +45,26 @@ macOS 解压后打开 `RSTerm.app`；Windows 解压后启动 `rsterm.exe`；Linu
 
 **macOS 包只有 ad-hoc 签名，没有 Developer ID 签名或 Apple 公证；Windows 包也没有发行者签名。** 系统可能阻止或警告运行未知来源的软件，不应把这些包描述为已受系统信任。自动构建不需要个人访问令牌、签名证书或账户密码。
 
-### 版本标签与 Draft Release
+### Release 自动附加二进制
 
-先确认 `Cargo.toml` 的版本，例如 `0.0.1`，再为准备发布的提交创建严格匹配的标签：
+先把工作流、`scripts/` 等修改提交并推送到 `main`。标签必须严格对应**该标签提交**的 `Cargo.toml` 版本，例如 `0.0.1` 对应 `v0.0.1`。支持以下入口：
+
+- **GitHub 页面手动发布**：创建并发布 Release（正式版或预发布版）后，`release: published` 自动构建该标签，成功后补齐 Assets。仅保存草稿不会触发此事件。新标签应包含本次工作流；给旧标签发布 Release 不会自动采用 main 后来新增的触发器。
+- **推送新标签**：标签 push 自动构建；如果没有对应 Release，创建附带二进制的 **Draft Release**，由你检查、下载试运行后发布。已有 Release 保持原来的公开/草稿状态。
+- **补齐已经存在的 Release**：进入 **Actions → Build binaries → Run workflow**，选择包含新工作流的 `main`，在 **release_tag** 填写 `v0.0.1`，再运行。无需删除 Release 或标签；成功后刷新 Release 页面查看 Assets。如果对应 Release 不存在，只创建草稿，不自动公开。
+
+例如，准备好发布的新提交可以主动执行：
 
 ```sh
 git tag v0.0.1
 git push origin v0.0.1
 ```
 
-这些命令会推送标签并触发发布流程，请只在准备好发布时主动执行。标签版本不匹配会失败；所有质量检查和四目标构建都成功后，工作流汇总程序包与 SHA-256 并创建 **Draft Release**。在 GitHub Releases 检查草稿、下载试运行，再由你手动发布；已有 Release 或同名资产不会被覆盖。
+不要为已经存在的标签重复执行创建命令或强行移动标签。手动补传虽然从 main 启动工作流，**编译的仍是填写标签的原提交**，不是 main 最新代码；各 job 使用同一提交 SHA，上传前再次核对标签。旧标签代码或仓库状态本身无法构建时，需要修复并正常发布新版本，不能把 main 的二进制冒充旧标签版本。
 
-默认工作流只有读取仓库权限，只有标签的 Draft Release job 获得 `contents: write`。如果仓库或组织禁止工作流写入，发布 job 会失败，需要仓库管理员允许这一权限；普通 Artifacts 构建不需要写权限。
+重复运行只补缺失附件，不更改 Release 的标题、说明或公开状态，也不覆盖/删除已有附件。完整的归档与校验文件对会先验证后保留；如果只上传了一半且与本次构建不一致，工作流明确失败，避免错误配对。**如果仓库启用了不可变 Release，公开后缺失的附件不能补传，必须先将二进制附加到草稿，再发布。**
+
+默认工作流只有读取仓库权限，只有明确发布标签的 `Attach release binaries` job 获得 `contents: write`，PR 不进入该 job。如果仓库或组织禁止工作流写入，发布 job 会失败，需要仓库管理员允许这一权限；普通 Artifacts 构建不需要写权限。
 
 ### 本地打包
 
