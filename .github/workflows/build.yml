@@ -5,14 +5,22 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to build and attach (e.g. v0.0.1); leave empty for Artifacts only"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && format('refs/tags/{0}', inputs.release_tag)) || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' && !startsWith(github.ref, 'refs/tags/') && !(github.event_name == 'workflow_dispatch' && inputs.release_tag != '') }}
 
 env:
   RUST_TOOLCHAIN: "1.99.1"
@@ -31,47 +39,55 @@ jobs:
     timeout-minutes: 5
     outputs:
       version: ${{ steps.version.outputs.version }}
+      source_sha: ${{ steps.version.outputs.source_sha }}
+      release_tag: ${{ steps.source.outputs.release_tag }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out workflow helpers
+        uses: actions/checkout@v4
         with:
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Select exact source ref
+        id: source
+        env:
+          MANUAL_RELEASE_TAG: ${{ inputs.release_tag }}
+          EVENT_RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: python scripts/release.py select-source
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.source.outputs.source_ref }}
+          path: source
+          persist-credentials: false
       - name: Validate package version and release tag
         id: version
         env:
-          BUILD_REF: ${{ github.ref }}
-          BUILD_REF_NAME: ${{ github.ref_name }}
-        shell: bash
-        run: |
-          python - <<'PY'
-          import os
-          from pathlib import Path
-          import sys
-          import tomllib
-          sys.path.insert(0, "scripts")
-          from package import validate_version
-          manifest = tomllib.loads(Path("Cargo.toml").read_text(encoding="utf-8"))
-          version = validate_version(manifest["package"]["version"])
-          toolchain = tomllib.loads(Path("rust-toolchain.toml").read_text(encoding="utf-8"))
-          if toolchain["toolchain"]["channel"] != os.environ["RUST_TOOLCHAIN"]:
-              raise SystemExit("Workflow and rust-toolchain.toml versions differ")
-          if os.environ["BUILD_REF"].startswith("refs/tags/"):
-              if os.environ["BUILD_REF_NAME"] != "v" + version:
-                  raise SystemExit("Release tag must equal v + Cargo.toml package version")
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write("version=" + version + "\n")
-          PY
+          EXPECTED_SHA: ${{ steps.source.outputs.expected_sha }}
+          VERSION_TAG: ${{ steps.source.outputs.version_tag }}
+        run: python scripts/release.py metadata --source source
 
   quality:
     name: macOS quality checks
     needs: metadata
     runs-on: macos-15
     timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: source
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out workflow helpers
+        uses: actions/checkout@v4
         with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.source_sha }}
+          path: source
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -86,8 +102,8 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
-          key: quality-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+            source/target
+          key: quality-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('source/Cargo.lock') }}
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check all targets
@@ -96,7 +112,8 @@ jobs:
         run: cargo test --locked
       - name: Deny Clippy warnings
         run: cargo clippy --all-targets --locked -- -D warnings
-      - name: Test release packaging
+      - name: Test release packaging and attachment
+        working-directory: .
         run: python -m unittest discover -s scripts -p 'test_*.py' -v
 
   build:
@@ -120,13 +137,24 @@ jobs:
             target: x86_64-unknown-linux-gnu
             binary: rsterm
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: source
     env:
       RUST_TARGET: ${{ matrix.target }}
       PACKAGE_VERSION: ${{ needs.metadata.outputs.version }}
       BINARY_NAME: ${{ matrix.binary }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out workflow helpers
+        uses: actions/checkout@v4
         with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.source_sha }}
+          path: source
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -168,8 +196,8 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
-          key: release-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+            source/target
+          key: release-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('source/Cargo.lock') }}
       - name: Compile all Windows and Linux targets
         if: runner.os != 'macOS'
         shell: bash
@@ -180,7 +208,7 @@ jobs:
       - name: Package release binary
         shell: bash
         run: |
-          python scripts/package.py \
+          python ../scripts/package.py \
             --target "$RUST_TARGET" \
             --version "$PACKAGE_VERSION" \
             --binary "target/$RUST_TARGET/release/$BINARY_NAME" \
@@ -189,14 +217,17 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rsterm-${{ matrix.target }}
-          path: dist/*
+          path: source/dist/*
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
 
-  draft-release:
-    name: Create draft release
-    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+  release:
+    name: Attach release binaries
+    if: >-
+      needs.metadata.outputs.release_tag != '' &&
+      (github.event_name == 'release' || github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')))
     needs: [metadata, quality, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -204,10 +235,13 @@ jobs:
       contents: write
     env:
       PACKAGE_VERSION: ${{ needs.metadata.outputs.version }}
-      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+      SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out workflow helpers
+        uses: actions/checkout@v4
         with:
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -217,50 +251,8 @@ jobs:
           pattern: rsterm-*
           path: packages
           merge-multiple: true
-      - name: Validate all four archives and checksums
-        shell: bash
-        run: |
-          python - <<'PY'
-          import hashlib
-          import os
-          from pathlib import Path
-          version = os.environ["PACKAGE_VERSION"]
-          if os.environ["RELEASE_TAG"] != "v" + version:
-              raise SystemExit("Release tag does not match package version")
-          suffixes = {
-              "aarch64-apple-darwin": ".app.zip",
-              "x86_64-apple-darwin": ".app.zip",
-              "x86_64-pc-windows-msvc": ".zip",
-              "x86_64-unknown-linux-gnu": ".tar.gz",
-          }
-          names = ["rsterm-" + version + "-" + target + suffix
-                   for target, suffix in suffixes.items()]
-          root = Path("packages")
-          expected = set(names + [name + ".sha256" for name in names])
-          if {path.name for path in root.iterdir()} != expected:
-              raise SystemExit("Expected exactly four archives and four checksums")
-          for name in names:
-              archive = root / name
-              checksum = root / (name + ".sha256")
-              if any(path.is_symlink() or not path.is_file() for path in (archive, checksum)):
-                  raise SystemExit("Release assets must be regular files")
-              digest = hashlib.sha256()
-              with archive.open("rb") as source:
-                  for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                      digest.update(chunk)
-              if checksum.read_text(encoding="ascii") != digest.hexdigest() + "  " + name + "\n":
-                  raise SystemExit("Checksum mismatch: " + name)
-          PY
-      - name: Create draft without replacing an existing release
+      - name: Validate and attach missing binaries without replacing assets
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        shell: bash
-        run: |
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            printf '%s\n' 'A release already exists for this tag; refusing to replace it.' >&2
-            exit 1
-          fi
-          gh release create "$RELEASE_TAG" packages/* \
-            --draft --verify-tag --title "RSTerm $PACKAGE_VERSION" \
-            --notes "Native desktop binaries and SHA-256 checksums. macOS apps are ad-hoc signed, not Developer ID signed or notarized. Linux binaries require a compatible GNU desktop runtime. Review and test all platform downloads before publishing."
+        run: python scripts/release.py attach --packages packages
